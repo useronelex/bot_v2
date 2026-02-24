@@ -1,4 +1,4 @@
-# 🚀 ШВИДКИЙ СТАРТ - Instagram Telegram Bot
+# 🚀 ШВИДКИЙ СТАРТ - Instagram & TikTok Telegram Bot
 
 ## ✅ Що змінено
 
@@ -52,6 +52,10 @@ WEBHOOK_URL=https://your-app.onrender.com
 https://your-app.onrender.com/            # Перевірка чи працює
 https://your-app.onrender.com/webhook_info # Статус webhook
 ```
+
+**Тепер надішліть боту посилання з:**
+- ✅ Instagram (Reels, Posts, IGTV)
+- ✅ TikTok (всі типи відео)
 
 ## 🆘 Якщо щось не працює
 

@@ -49,7 +49,19 @@ def extract_video_url(text: str) -> tuple[str, str] | None:
 def download_video(url: str, output_dir: str) -> str | None:
     """Download video from Instagram or TikTok using yt-dlp. Returns filepath or None."""
     output_template = os.path.join(output_dir, "%(id)s.%(ext)s")
+
+
+
     
+    # Записуємо cookies у тимчасовий файл
+    cookies_file = None
+    instagram_cookies = os.environ.get("INSTAGRAM_COOKIES", "")
+    if instagram_cookies and 'instagram' in url:
+        cookies_path = os.path.join(output_dir, "cookies.txt")
+        with open(cookies_path, "w") as f:
+            f.write(instagram_cookies)
+        cookies_file = cookies_path
+       
     ydl_opts = {
         "outtmpl": output_template,
         # Format string: пріоритет комбінованим форматам
@@ -79,6 +91,10 @@ def download_video(url: str, output_dir: str) -> str | None:
         # Limit file size to 50MB (Telegram Bot API limit)
         "max_filesize": 50 * 1024 * 1024,
     }
+    
+     # Додаємо cookies якщо є
+    if cookies_file:
+        ydl_opts["cookiefile"] = cookies_file
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:

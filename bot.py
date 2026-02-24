@@ -19,22 +19,55 @@ INSTAGRAM_URL_PATTERN = re.compile(
     r'https?://(?:www\.)?instagram\.com/(?:reel|p|tv)/[A-Za-z0-9_\-]+(?:/[^\s]*)?'
 )
 
+TIKTOK_URL_PATTERN = re.compile(
+    r'https?://(?:www\.|vm\.|vt\.|m\.)?tiktok\.com/(?:@[\w\.-]+/video/\d+|v/\d+\.html|[\w\-]+)(?:/[^\s]*)?'
+)
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")  # Наприклад: https://your-app.onrender.com
 
 
-def extract_instagram_url(text: str) -> str | None:
-    match = INSTAGRAM_URL_PATTERN.search(text)
-    return match.group(0) if match else None
+def extract_video_url(text: str) -> tuple[str, str] | None:
+    """
+    Extract Instagram or TikTok URL from text.
+    Returns: (url, platform) or None
+    platform: 'instagram' or 'tiktok'
+    """
+    # Спочатку перевіряємо Instagram
+    instagram_match = INSTAGRAM_URL_PATTERN.search(text)
+    if instagram_match:
+        return (instagram_match.group(0), 'instagram')
+    
+    # Потім перевіряємо TikTok
+    tiktok_match = TIKTOK_URL_PATTERN.search(text)
+    if tiktok_match:
+        return (tiktok_match.group(0), 'tiktok')
+    
+    return None
 
 
 def download_video(url: str, output_dir: str) -> str | None:
-    """Download Instagram video using yt-dlp. Returns filepath or None."""
+    """Download video from Instagram or TikTok using yt-dlp. Returns filepath or None."""
     output_template = os.path.join(output_dir, "%(id)s.%(ext)s")
     
     ydl_opts = {
         "outtmpl": output_template,
-        "format": "mp4/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        # Format string: пріоритет комбінованим форматам
+        "format": (
+            "bestvideo[ext=mp4][height<=1920]+bestaudio[ext=m4a]/"  # Відео+аудіо окремо (до 1080p)
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"                 # Відео+аудіо окремо (будь-яка якість)
+            "bestvideo+bestaudio/"                                    # Будь-які формати
+            "best[ext=mp4][height<=1920]/"                           # Комбінований mp4 до 1080p
+            "best[ext=mp4]/"                                          # Комбінований mp4
+            "best"                                                     # Будь-який найкращий
+        ),
+        # Об'єднати відео+аудіо в один файл
+        "merge_output_format": "mp4",
+        # Постобробка через ffmpeg
+        "postprocessors": [{
+            "key": "FFmpegVideoConvertor",
+            "preferedformat": "mp4",
+        }],
         "quiet": True,
         "no_warnings": True,
         "http_headers": {
@@ -77,11 +110,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not message or not message.text:
         return
 
-    instagram_url = extract_instagram_url(message.text)
-    if not instagram_url:
+    video_info = extract_video_url(message.text)
+    if not video_info:
         return
-
-    logger.info(f"Processing Instagram URL: {instagram_url}")
+    
+    video_url, platform = video_info
+    logger.info(f"Processing {platform.title()} URL: {video_url}")
     
     # Show "uploading video" action
     await context.bot.send_chat_action(
@@ -91,23 +125,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         video_path = await asyncio.get_event_loop().run_in_executor(
-            None, download_video, instagram_url, tmp_dir
+            None, download_video, video_url, tmp_dir
         )
 
         if not video_path or not Path(video_path).exists():
-            logger.warning(f"Failed to download: {instagram_url}")
-            await message.reply_text(
+            logger.warning(f"Failed to download: {video_url}")
+            error_msg = await message.reply_text(
                 "❌ Не вдалося завантажити відео. Можливо, воно приватне або недоступне.",
                 reply_to_message_id=message.message_id
             )
+            # Видалити повідомлення про помилку через 10 секунд
+            await asyncio.sleep(10)
+            try:
+                await error_msg.delete()
+            except Exception as e:
+                logger.warning(f"Could not delete error message: {e}")
             return
 
         file_size = Path(video_path).stat().st_size
         if file_size > 50 * 1024 * 1024:
-            await message.reply_text(
+            error_msg = await message.reply_text(
                 "❌ Відео завелике для відправки (понад 50 МБ).",
                 reply_to_message_id=message.message_id
             )
+            # Видалити повідомлення про помилку через 10 секунд
+            await asyncio.sleep(10)
+            try:
+                await error_msg.delete()
+            except Exception as e:
+                logger.warning(f"Could not delete error message: {e}")
             return
 
         try:
@@ -116,8 +162,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     chat_id=message.chat_id,
                     video=video_file,
                     supports_streaming=True
-                   # caption=f"📲 @{message.from_user.username or message.from_user.first_name}" 
-                   #         if message.chat.type in ("group", "supergroup") else None
                 )
             
             # Delete original message with the link
@@ -128,10 +172,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         except Exception as e:
             logger.error(f"Failed to send video: {e}")
-            await message.reply_text(
+            error_msg = await message.reply_text(
                 "❌ Помилка при відправці відео. Спробуйте пізніше.",
                 reply_to_message_id=message.message_id
             )
+            # Видалити повідомлення про помилку через 10 секунд
+            await asyncio.sleep(10)
+            try:
+                await error_msg.delete()
+            except Exception as e:
+                logger.warning(f"Could not delete error message: {e}")
 
 
 def create_application() -> Application:

@@ -4,6 +4,7 @@ Entry point for Render.com deployment with webhook support.
 
 import os
 import logging
+import asyncio
 from flask import Flask, request
 from telegram import Update
 from bot import create_application, BOT_TOKEN, WEBHOOK_URL
@@ -32,11 +33,12 @@ def health():
 
 
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
-async def webhook():
+def webhook():
     """Handle incoming Telegram updates via webhook."""
     try:
         update = Update.de_json(request.get_json(force=True), telegram_app.bot)
-        await telegram_app.process_update(update)
+        # Run async function in sync context
+        asyncio.run(telegram_app.process_update(update))
         return "ok", 200
     except Exception as e:
         logger.error(f"Error processing update: {e}")
@@ -44,7 +46,7 @@ async def webhook():
 
 
 @app.route("/set_webhook")
-async def set_webhook():
+def set_webhook():
     """
     Set the webhook URL for the bot.
     Visit this endpoint once after deployment: https://your-app.onrender.com/set_webhook
@@ -54,13 +56,17 @@ async def set_webhook():
     
     try:
         webhook_url = f"{WEBHOOK_URL}/{BOT_TOKEN}"
-        await telegram_app.bot.set_webhook(
-            url=webhook_url,
-            allowed_updates=["message"]
-        )
         
-        # Verify webhook was set
-        webhook_info = await telegram_app.bot.get_webhook_info()
+        # Run async function in sync context
+        async def _set_webhook():
+            await telegram_app.bot.set_webhook(
+                url=webhook_url,
+                allowed_updates=["message"]
+            )
+            # Verify webhook was set
+            return await telegram_app.bot.get_webhook_info()
+        
+        webhook_info = asyncio.run(_set_webhook())
         
         return {
             "status": "success",
@@ -77,20 +83,27 @@ async def set_webhook():
 
 
 @app.route("/delete_webhook")
-async def delete_webhook():
+def delete_webhook():
     """Delete the webhook (useful for debugging)."""
     try:
-        await telegram_app.bot.delete_webhook()
+        async def _delete():
+            await telegram_app.bot.delete_webhook()
+        
+        asyncio.run(_delete())
         return {"status": "webhook deleted"}, 200
     except Exception as e:
         return {"status": "error", "message": str(e)}, 500
 
 
 @app.route("/webhook_info")
-async def webhook_info():
+def webhook_info():
     """Get current webhook information."""
     try:
-        info = await telegram_app.bot.get_webhook_info()
+        async def _get_info():
+            return await telegram_app.bot.get_webhook_info()
+        
+        info = asyncio.run(_get_info())
+        
         return {
             "url": info.url,
             "has_custom_certificate": info.has_custom_certificate,
@@ -104,11 +117,14 @@ async def webhook_info():
         return {"status": "error", "message": str(e)}, 500
 
 
-async def initialize_bot():
+def initialize_bot():
     """Initialize the bot on startup."""
     try:
-        await telegram_app.initialize()
-        await telegram_app.start()
+        async def _init():
+            await telegram_app.initialize()
+            await telegram_app.start()
+        
+        asyncio.run(_init())
         logger.info("Bot initialized successfully")
     except Exception as e:
         logger.error(f"Failed to initialize bot: {e}")
@@ -123,12 +139,11 @@ if __name__ == "__main__":
         logger.warning("WEBHOOK_URL not set. Remember to set it in Render environment variables!")
     
     # Initialize bot
-    import asyncio
-    asyncio.run(initialize_bot())
+    initialize_bot()
     
     # Start Flask server
     port = int(os.environ.get("PORT", 10000))
     logger.info(f"Starting Flask server on port {port}")
-    logger.info(f"After deployment, visit https://your-app.onrender.com/set_webhook to activate the bot")
+    logger.info(f"After deployment, visit {WEBHOOK_URL}/set_webhook to activate the bot")
     
     app.run(host="0.0.0.0", port=port, debug=False)

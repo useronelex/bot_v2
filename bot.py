@@ -3,11 +3,22 @@ import re
 import logging
 import asyncio
 import tempfile
+
+from collections import deque
+import time
+
 from pathlib import Path
 
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 import yt_dlp
+
+
+request_timestamps = deque()
+REQUEST_LIMIT = 60  # максимум запитів
+REQUEST_WINDOW = 3600  # за 1 годину (секунди)
+COOLDOWN_TIME = 1800  # відпочинок 30 хв (секунди)
+cooldown_until = 0  # час до якого бот відпочиває
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -129,6 +140,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     video_info = extract_video_url(message.text)
     if not video_info:
         return
+
+    # Rate limit перевірка
+    global cooldown_until
+    now = time.time()
+
+    if now < cooldown_until:
+        remaining = int((cooldown_until - now) / 60)
+        await message.reply_text(f"⏳ Бот відпочиває. Спробуй через {remaining} хв.")
+        return
+
+    # Видаляємо старі запити (старші за 1 годину)
+    while request_timestamps and request_timestamps[0] < now - REQUEST_WINDOW:
+        request_timestamps.popleft()
+
+    if len(request_timestamps) >= REQUEST_LIMIT:
+        cooldown_until = now + COOLDOWN_TIME
+        await message.reply_text("⏳ Досягнуто ліміт запитів. Бот відпочиває 30 хв.")
+        return
+
+    request_timestamps.append(now)
     
     video_url, platform = video_info
     logger.info(f"Processing {platform.title()} URL: {video_url}")

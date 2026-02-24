@@ -115,9 +115,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await context.bot.send_video(
                     chat_id=message.chat_id,
                     video=video_file,
-                    supports_streaming=True,
-                    caption=f"📲 @{message.from_user.username or message.from_user.first_name}" 
-                            if message.chat.type in ("group", "supergroup") else None
+                    supports_streaming=True
+                   # caption=f"📲 @{message.from_user.username or message.from_user.first_name}" 
+                   #         if message.chat.type in ("group", "supergroup") else None
                 )
             
             # Delete original message with the link

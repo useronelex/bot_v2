@@ -1,0 +1,7 @@
+python-telegram-bot==21.6
+yt-dlp==2024.12.13
+flask==3.1.0
+<<<<<<< HEAD
+requests==2.31.0
+=======
+>>>>>>> 836674abcf72b74e4ae18c6698672cc554bee233

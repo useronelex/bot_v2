@@ -3,10 +3,7 @@ import re
 import logging
 import asyncio
 import tempfile
-<<<<<<< HEAD
 import requests  # Додано для API fallback методу
-=======
->>>>>>> 836674abcf72b74e4ae18c6698672cc554bee233
 
 from collections import deque
 import time
@@ -61,7 +58,6 @@ def extract_video_url(text: str) -> tuple[str, str] | None:
     return None
 
 
-<<<<<<< HEAD
 def download_instagram_via_api(instagram_url: str, output_path: str) -> bool:
     """
     Завантажити Instagram через публічні API (без cookies).
@@ -145,15 +141,6 @@ def download_video(url: str, output_dir: str) -> str | None:
             logger.warning(f"Instagram API method failed: {e}, trying yt-dlp fallback...")
     
     # ⚠️ FALLBACK: yt-dlp з cookies (для Instagram якщо API не спрацював, або для TikTok)
-=======
-def download_video(url: str, output_dir: str) -> str | None:
-    """Download video from Instagram or TikTok using yt-dlp. Returns filepath or None."""
-    output_template = os.path.join(output_dir, "%(id)s.%(ext)s")
-
-
-
-    
->>>>>>> 836674abcf72b74e4ae18c6698672cc554bee233
     # Записуємо cookies у тимчасовий файл
     cookies_file = None
     instagram_cookies = os.environ.get("INSTAGRAM_COOKIES", "")
@@ -193,18 +180,12 @@ def download_video(url: str, output_dir: str) -> str | None:
         "max_filesize": 50 * 1024 * 1024,
     }
     
-<<<<<<< HEAD
     # Додаємо cookies якщо є
     if cookies_file:
         ydl_opts["cookiefile"] = cookies_file
         logger.info("Using yt-dlp fallback with cookies")
     else:
         logger.info("Using yt-dlp for TikTok")
-=======
-     # Додаємо cookies якщо є
-    if cookies_file:
-        ydl_opts["cookiefile"] = cookies_file
->>>>>>> 836674abcf72b74e4ae18c6698672cc554bee233
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:

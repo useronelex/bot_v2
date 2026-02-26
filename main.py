@@ -35,7 +35,7 @@ def run_async(coro):
         asyncio.set_event_loop(loop)
     
     future = asyncio.run_coroutine_threadsafe(coro, loop)
-    return future.result(timeout=30)
+    return future.result(timeout=180)
 
 
 def start_event_loop():

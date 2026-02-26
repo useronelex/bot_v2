@@ -29,19 +29,19 @@ logger = logging.getLogger(__name__)
 
 # URL patterns для різних платформ
 INSTAGRAM_URL_PATTERN = re.compile(
-    r'https?://(?:www\.)?instagram\.com/(?:reel|p|tv)/[A-Za-z0-9_\-]+(?:/[^\s]*)?'
+    r'https?://(?:www\.)?instagram\.com/(?:reels?|p|tv)/[A-Za-z0-9_\-]+(?:/[^\s]*)?'
 )
 
 TIKTOK_URL_PATTERN = re.compile(
     r'https?://(?:www\.|vm\.|vt\.|m\.)?tiktok\.com/(?:@[\w\.-]+/video/\d+|v/\d+\.html|[\w\-]+)(?:/[^\s]*)?'
 )
 
-YOUTUBE_URL_PATTERN = re.compile(
-    r'https?://(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)[\w\-]+'
-)
+# YOUTUBE_URL_PATTERN = re.compile(
+#     r'https?://(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)[\w\-]+'
+# )
 
 FACEBOOK_URL_PATTERN = re.compile(
-    r'https?://(?:www\.|m\.|web\.)?facebook\.com/(?:watch/?\?v=|[\w\-\.]+/videos/)[\d\w\-]+'
+    r'https?://(?:www\.|m\.|web\.)?facebook\.com/(?:watch/?\?v=|[\w\-\.]+/videos/|share/v/)[\d\w\-]+'
 )
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -378,7 +378,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     chat_id=message.chat_id,
                     video=video_file,
                     supports_streaming=True,
-                    caption=f"{emoji} {platform.title()}"
+                    # caption=f"{emoji} {platform.title()}"
                 )
             
             # Delete original message

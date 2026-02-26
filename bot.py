@@ -4,10 +4,9 @@ import logging
 import asyncio
 import tempfile
 import random
-
-from collections import deque
 import time
 
+from collections import deque
 from pathlib import Path
 
 from telegram import Update
@@ -15,11 +14,15 @@ from telegram.ext import Application, MessageHandler, filters, ContextTypes
 import yt_dlp
 
 
-request_timestamps = deque()
-REQUEST_LIMIT = 60  # максимум запитів
-REQUEST_WINDOW = 3600  # за 1 годину (секунди)
-COOLDOWN_TIME = 1800  # відпочинок 30 хв (секунди)
-cooldown_until = 0  # час до якого бот відпочиває
+# ──────────────────────────────────────────
+# RATE LIMIT — per user (не глобальний!)
+# ──────────────────────────────────────────
+REQUEST_LIMIT = 20       # максимум запитів на юзера
+REQUEST_WINDOW = 3600    # за 1 годину (секунди)
+COOLDOWN_TIME  = 1800    # відпочинок 30 хв (секунди)
+
+user_timestamps: dict[int, deque] = {}
+user_cooldowns:  dict[int, float] = {}
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -27,141 +30,103 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# URL patterns для різних платформ
+
+# ──────────────────────────────────────────
+# URL PATTERNS
+# ──────────────────────────────────────────
 INSTAGRAM_URL_PATTERN = re.compile(
     r'https?://(?:www\.)?instagram\.com/(?:reels?|p|tv)/[A-Za-z0-9_\-]+(?:/[^\s]*)?'
 )
-
 TIKTOK_URL_PATTERN = re.compile(
     r'https?://(?:www\.|vm\.|vt\.|m\.)?tiktok\.com/(?:@[\w\.-]+/video/\d+|v/\d+\.html|[\w\-]+)(?:/[^\s]*)?'
 )
-
 FACEBOOK_URL_PATTERN = re.compile(
     r'https?://(?:www\.|m\.|web\.)?facebook\.com/(?:watch/?\?v=|[\w\-\.]+/videos/|share/[vr]/)[\d\w\-]+'
 )
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 
-# Ротація User-Agent для обходу блокувань
+
+# ──────────────────────────────────────────
+# USER AGENTS
+# ──────────────────────────────────────────
 USER_AGENTS = [
-    # Mobile
     "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
     "Mozilla/5.0 (iPhone; CPU iPhone OS 15_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.6 Mobile/15E148 Safari/604.1",
     "Mozilla/5.0 (Linux; Android 12; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Mobile Safari/537.36",
     "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Mobile Safari/537.36",
-    # Desktop (для YouTube, Facebook)
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 ]
 
 
+# ──────────────────────────────────────────
+# Cookies — читаємо один раз при старті
+# ──────────────────────────────────────────
+_COOKIES_FILE: str | None = None
+
+def _init_cookies() -> str | None:
+    """Записує Instagram cookies у файл один раз при старті."""
+    global _COOKIES_FILE
+    instagram_cookies = os.environ.get("INSTAGRAM_COOKIES", "")
+    if not instagram_cookies:
+        return None
+    cookies_path = "/tmp/instagram_cookies.txt"
+    with open(cookies_path, "w") as f:
+        f.write(instagram_cookies)
+    logger.info("Instagram cookies loaded from environment")
+    _COOKIES_FILE = cookies_path
+    return cookies_path
+
+
+# ──────────────────────────────────────────
+# URL EXTRACTOR
+# ──────────────────────────────────────────
 def extract_video_url(text: str) -> tuple[str, str] | None:
-    """
-    Extract video URL from text.
-    Returns: (url, platform) or None
-    platform: 'instagram', 'tiktok', 'facebook'
-    """
-    # Instagram
-    instagram_match = INSTAGRAM_URL_PATTERN.search(text)
-    if instagram_match:
-        return (instagram_match.group(0), 'instagram')
-    
-    # TikTok
-    tiktok_match = TIKTOK_URL_PATTERN.search(text)
-    if tiktok_match:
-        return (tiktok_match.group(0), 'tiktok')
-    
-    # Facebook
-    facebook_match = FACEBOOK_URL_PATTERN.search(text)
-    if facebook_match:
-        return (facebook_match.group(0), 'facebook')
-    
+    for pattern, platform in [
+        (INSTAGRAM_URL_PATTERN, "instagram"),
+        (TIKTOK_URL_PATTERN,    "tiktok"),
+        (FACEBOOK_URL_PATTERN,  "facebook"),
+    ]:
+        match = pattern.search(text)
+        if match:
+            return (match.group(0), platform)
     return None
 
 
+# ──────────────────────────────────────────
+# DOWNLOADER
+# ──────────────────────────────────────────
 def download_video(url: str, output_dir: str, platform: str) -> str | None:
-    """
-    Download video using yt-dlp with optimized settings for each platform.
-    
-    Args:
-        url: Video URL
-        output_dir: Output directory
-        platform: 'instagram', 'tiktok', 'facebook'
-    
-    Returns:
-        Path to downloaded video or None
-    """
     output_template = os.path.join(output_dir, "%(id)s.%(ext)s")
-    
-    # Випадковий User-Agent
     user_agent = random.choice(USER_AGENTS)
-    
-    # Базові опції для всіх платформ з iPhone compatibility
+
     base_opts = {
-        "outtmpl": output_template,
-        "quiet": False,
-        "no_warnings": False,
+        "outtmpl":          output_template,
+        "quiet":            False,
+        "no_warnings":      False,
+        "socket_timeout":   30,
+        "retries":          10,
+        "fragment_retries": 10,
+        "max_filesize":     50 * 1024 * 1024,
         "http_headers": {
             "User-Agent": user_agent,
         },
-        "socket_timeout": 30,
-        "retries": 10,  # Збільшено для TikTok
-        "fragment_retries": 10,
-        "max_filesize": 50 * 1024 * 1024,
     }
-    
-    # Специфічні налаштування для кожної платформи
-    if platform == 'instagram':
-        # Instagram
-        cookies_file = None
-        instagram_cookies = os.environ.get("INSTAGRAM_COOKIES", "")
-        if instagram_cookies:
-            cookies_path = os.path.join(output_dir, "cookies.txt")
-            with open(cookies_path, "w") as f:
-                f.write(instagram_cookies)
-            cookies_file = cookies_path
-        
+
+    if platform == "instagram":
         ydl_opts = {
             **base_opts,
-            "format": (
-                "bestvideo[ext=mp4][height<=1920]+bestaudio[ext=m4a]/"
-                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
-                "bestvideo+bestaudio/"
-                "best[ext=mp4][height<=1920]/"
-                "best[ext=mp4]/"
-                "best"
-            ),
+            # ✅ ФІКС: беремо готовий mp4 без злиття потоків → нема помилки ffmpeg merge
+            "format": "best[ext=mp4]/best",
             "merge_output_format": "mp4",
-            "postprocessors": [
-                {
-                    "key": "FFmpegVideoConvertor",
-                    "preferedformat": "mp4",
-                },
-                {
-                    "key": "FFmpegMetadata",
-                },
-            ],
         }
-        # Видаляємо postprocessor_args з base (ffmpeg args передаються окремо)
-        if 'postprocessor_args' in ydl_opts:
-            del ydl_opts['postprocessor_args']
-        # Додаємо iPhone compatibility через FFmpeg postprocessor
-        ydl_opts["postprocessor_args"] = {
-            "ffmpeg": [
-                "-movflags", "+faststart",
-                "-profile:v", "baseline",
-                "-level", "3.0",
-                "-pix_fmt", "yuv420p"
-            ]
-        }
-        
-        if cookies_file:
-            ydl_opts["cookiefile"] = cookies_file
+        if _COOKIES_FILE:
+            ydl_opts["cookiefile"] = _COOKIES_FILE
             logger.info("Instagram: Using cookies")
-    
-    elif platform == 'tiktok':
-        # TikTok - агресивні налаштування для обходу блокувань
+
+    elif platform == "tiktok":
         ydl_opts = {
             **base_opts,
             "format": (
@@ -171,42 +136,27 @@ def download_video(url: str, output_dir: str, platform: str) -> str | None:
                 "best"
             ),
             "merge_output_format": "mp4",
-            "postprocessors": [
-                {
-                    "key": "FFmpegVideoConvertor",
-                    "preferedformat": "mp4",
-                },
-            ],
-            # iPhone compatibility
+            # ✅ ФІКС: для merger використовуємо copy щоб не перекодовувати
             "postprocessor_args": {
-                "ffmpeg": [
-                    "-movflags", "+faststart",
-                    "-profile:v", "baseline",
-                    "-level", "3.0",
-                    "-pix_fmt", "yuv420p"
-                ]
+                "merger": ["-c", "copy"],
             },
-            # TikTok специфічні опції - максимальна агресивність
             "http_headers": {
-                "User-Agent": user_agent,
-                "Referer": "https://www.tiktok.com/",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
-                "Accept-Encoding": "gzip, deflate",
-                "Connection": "keep-alive",
+                "User-Agent":              user_agent,
+                "Referer":                 "https://www.tiktok.com/",
+                "Accept":                  "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language":         "en-US,en;q=0.5",
+                "Accept-Encoding":         "gzip, deflate",
+                "Connection":              "keep-alive",
                 "Upgrade-Insecure-Requests": "1",
             },
-            # Додаткові налаштування для обходу
-            "nocheckcertificate": True,  # Ігнорувати SSL помилки
-            "prefer_insecure": False,
-            "extractor_retries": 10,  # Більше спроб для extractor
-            "sleep_interval": 2,  # Затримка між спробами
+            "nocheckcertificate": True,
+            "extractor_retries":  10,
+            "sleep_interval":     2,
             "max_sleep_interval": 5,
         }
         logger.info("TikTok: Using aggressive anti-blocking mode")
-    
-    elif platform == 'facebook':
-        # Facebook - підтримка різних форматів URL включно з /share/r/
+
+    elif platform == "facebook":
         ydl_opts = {
             **base_opts,
             "format": (
@@ -216,88 +166,116 @@ def download_video(url: str, output_dir: str, platform: str) -> str | None:
                 "best"
             ),
             "merge_output_format": "mp4",
-            "postprocessors": [
-                {
-                    "key": "FFmpegVideoConvertor",
-                    "preferedformat": "mp4",
-                },
-            ],
-            # iPhone compatibility
             "postprocessor_args": {
-                "ffmpeg": [
-                    "-movflags", "+faststart",
-                    "-profile:v", "baseline",
-                    "-level", "3.0",
-                    "-pix_fmt", "yuv420p"
-                ]
+                "merger": ["-c", "copy"],
             },
-            # Facebook специфічні налаштування
             "http_headers": {
-                "User-Agent": user_agent,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "User-Agent":    user_agent,
+                "Accept":        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.5",
                 "Sec-Fetch-Mode": "navigate",
             },
         }
         logger.info("Facebook: Using web scraping mode")
-    
+
     else:
-        # Fallback для невідомих платформ
         ydl_opts = {
             **base_opts,
             "format": "best[ext=mp4]/best",
             "merge_output_format": "mp4",
         }
-    
+
     try:
         logger.info(f"Downloading {platform} video with yt-dlp...")
         logger.info(f"URL: {url}")
         logger.info(f"Format: {ydl_opts.get('format', 'best')}")
-        
-        # Затримка для уникнення rate limiting
+
         time.sleep(random.uniform(0.5, 2))
-        
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Спроба завантажити
             info = ydl.extract_info(url, download=True)
             if info is None:
                 logger.error(f"{platform}: yt-dlp returned None")
                 return None
-            
-            logger.info(f"Video info: {info.get('title', 'Unknown')}")
-            logger.info(f"Duration: {info.get('duration', 0)} seconds")
-            logger.info(f"Has audio: {info.get('acodec', 'none') != 'none'}")
-            logger.info(f"Has video: {info.get('vcodec', 'none') != 'none'}")
-            logger.info(f"Format ID: {info.get('format_id', 'unknown')}")
-            
-            # Пошук завантаженого файлу
+
+            logger.info(f"Title: {info.get('title', 'Unknown')}")
+            logger.info(f"Duration: {info.get('duration', 0)}s | Format: {info.get('format_id', '?')}")
+
             filename = ydl.prepare_filename(info)
             base = Path(filename).stem
-            
-            # Шукаємо відео файл
+
+            # Шукаємо файл за stem
             for f in Path(output_dir).iterdir():
                 if f.stem == base and f.suffix in (".mp4", ".mov", ".mkv", ".webm"):
-                    file_size = f.stat().st_size / 1024 / 1024  # MB
-                    logger.info(f"Found video file: {f.name}, size: {file_size:.2f}MB")
+                    size_mb = f.stat().st_size / 1024 / 1024
+                    logger.info(f"Found: {f.name} ({size_mb:.2f} MB)")
                     return str(f)
-            
-            # Fallback: перший відео файл
+
+            # Fallback: перший відеофайл
             for f in Path(output_dir).iterdir():
                 if f.suffix in (".mp4", ".mov", ".mkv", ".webm"):
-                    logger.info(f"Fallback: Found video file: {f.name}")
+                    logger.info(f"Fallback file: {f.name}")
                     return str(f)
-            
+
             logger.error("No video file found in output directory")
             return None
-            
+
     except yt_dlp.utils.DownloadError as e:
-        logger.error(f"yt-dlp DownloadError for {platform}: {e}")
+        logger.error(f"yt-dlp DownloadError [{platform}]: {e}")
         return None
     except Exception as e:
-        logger.error(f"yt-dlp error for {platform}: {e}", exc_info=True)
+        logger.error(f"yt-dlp error [{platform}]: {e}", exc_info=True)
         return None
 
 
+# ──────────────────────────────────────────
+# TYPING INDICATOR — постійний під час завантаження
+# ──────────────────────────────────────────
+async def keep_uploading_action(chat_id: int, bot) -> None:
+    """Надсилає 'upload_video' кожні 4 секунди поки не скасовано."""
+    try:
+        while True:
+            await bot.send_chat_action(chat_id=chat_id, action="upload_video")
+            await asyncio.sleep(4)
+    except asyncio.CancelledError:
+        pass
+
+
+# ──────────────────────────────────────────
+# RATE LIMIT — per user
+# ──────────────────────────────────────────
+def check_rate_limit(user_id: int) -> tuple[bool, int]:
+    """
+    Перевіряє ліміт для конкретного юзера.
+    Returns: (allowed, cooldown_remaining_minutes)
+    """
+    now = time.time()
+
+    # Перевірка cooldown
+    cooldown = user_cooldowns.get(user_id, 0)
+    if now < cooldown:
+        remaining = int((cooldown - now) / 60)
+        return False, remaining
+
+    # Очищаємо старі записи
+    if user_id not in user_timestamps:
+        user_timestamps[user_id] = deque()
+    timestamps = user_timestamps[user_id]
+    while timestamps and timestamps[0] < now - REQUEST_WINDOW:
+        timestamps.popleft()
+
+    # Перевірка ліміту
+    if len(timestamps) >= REQUEST_LIMIT:
+        user_cooldowns[user_id] = now + COOLDOWN_TIME
+        return False, COOLDOWN_TIME // 60
+
+    timestamps.append(now)
+    return True, 0
+
+
+# ──────────────────────────────────────────
+# HANDLER
+# ──────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if not message or not message.text:
@@ -307,121 +285,106 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not video_info:
         return
 
-    # Rate limit перевірка
-    global cooldown_until
-    now = time.time()
+    user_id = message.from_user.id
+    allowed, cooldown_mins = check_rate_limit(user_id)
 
-    if now < cooldown_until:
-        remaining = int((cooldown_until - now) / 60)
-        error_msg = await message.reply_text(
-            f"⏳ Бот відпочиває. Спробуй через {remaining} хв.",
+    if not allowed:
+        err = await message.reply_text(
+            f"⏳ Ти надіслав забагато запитів. Спробуй через {cooldown_mins} хв.",
             reply_to_message_id=message.message_id
         )
         await asyncio.sleep(10)
         try:
-            await error_msg.delete()
-        except:
+            await err.delete()
+        except Exception:
             pass
         return
 
-    while request_timestamps and request_timestamps[0] < now - REQUEST_WINDOW:
-        request_timestamps.popleft()
-
-    if len(request_timestamps) >= REQUEST_LIMIT:
-        cooldown_until = now + COOLDOWN_TIME
-        error_msg = await message.reply_text(
-            "⏳ Досягнуто ліміт запитів. Бот відпочиває 30 хв.",
-            reply_to_message_id=message.message_id
-        )
-        await asyncio.sleep(10)
-        try:
-            await error_msg.delete()
-        except:
-            pass
-        return
-
-    request_timestamps.append(now)
-    
     video_url, platform = video_info
-    logger.info(f"Processing {platform.upper()} URL: {video_url}")
-    
-    await context.bot.send_chat_action(
-        chat_id=message.chat_id,
-        action="upload_video"
+    logger.info(f"Processing {platform.upper()} URL: {video_url} | user_id={user_id}")
+
+    # ✅ Постійний індикатор завантаження
+    typing_task = asyncio.create_task(
+        keep_uploading_action(message.chat_id, context.bot)
     )
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        video_path = await asyncio.get_event_loop().run_in_executor(
-            None, download_video, video_url, tmp_dir, platform
-        )
-
-        if not video_path or not Path(video_path).exists():
-            logger.warning(f"Failed to download {platform}: {video_url}")
-            error_msg = await message.reply_text(
-                f"❌ Не вдалося завантажити відео з {platform.title()}.\n"
-                f"Можливо, воно приватне або недоступне.",
-                reply_to_message_id=message.message_id
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            video_path = await asyncio.get_event_loop().run_in_executor(
+                None, download_video, video_url, tmp_dir, platform
             )
-            await asyncio.sleep(10)
-            try:
-                await error_msg.delete()
-            except Exception as e:
-                logger.warning(f"Could not delete error message: {e}")
-            return
 
-        file_size = Path(video_path).stat().st_size
-        if file_size > 50 * 1024 * 1024:
-            error_msg = await message.reply_text(
-                f"❌ Відео з {platform.title()} завелике для відправки (понад 50 МБ).",
-                reply_to_message_id=message.message_id
-            )
-            await asyncio.sleep(10)
-            try:
-                await error_msg.delete()
-            except Exception as e:
-                logger.warning(f"Could not delete error message: {e}")
-            return
-
-        try:
-            with open(video_path, "rb") as video_file:
-                await context.bot.send_video(
-                    chat_id=message.chat_id,
-                    video=video_file,
-                    supports_streaming=True
+            if not video_path or not Path(video_path).exists():
+                logger.warning(f"Failed to download {platform}: {video_url}")
+                err = await message.reply_text(
+                    f"❌ Не вдалося завантажити відео з {platform.title()}.\n"
+                    f"Можливо, воно приватне або недоступне.",
+                    reply_to_message_id=message.message_id
                 )
-            
-            # Delete original message
+                await asyncio.sleep(10)
+                try:
+                    await err.delete()
+                except Exception:
+                    pass
+                return
+
+            file_size = Path(video_path).stat().st_size
+            if file_size > 50 * 1024 * 1024:
+                err = await message.reply_text(
+                    f"❌ Відео завелике для відправки (понад 50 МБ).",
+                    reply_to_message_id=message.message_id
+                )
+                await asyncio.sleep(10)
+                try:
+                    await err.delete()
+                except Exception:
+                    pass
+                return
+
             try:
-                await message.delete()
+                with open(video_path, "rb") as video_file:
+                    await context.bot.send_video(
+                        chat_id=message.chat_id,
+                        video=video_file,
+                        supports_streaming=True
+                    )
+                try:
+                    await message.delete()
+                except Exception as e:
+                    logger.warning(f"Could not delete original message: {e}")
+
             except Exception as e:
-                logger.warning(f"Could not delete original message: {e}")
+                logger.error(f"Failed to send video [{platform}]: {e}")
+                err = await message.reply_text(
+                    f"❌ Помилка при відправці відео. Спробуйте пізніше.",
+                    reply_to_message_id=message.message_id
+                )
+                await asyncio.sleep(10)
+                try:
+                    await err.delete()
+                except Exception:
+                    pass
+    finally:
+        typing_task.cancel()
 
-        except Exception as e:
-            logger.error(f"Failed to send video from {platform}: {e}")
-            error_msg = await message.reply_text(
-                f"❌ Помилка при відправці відео з {platform.title()}. Спробуйте пізніше.",
-                reply_to_message_id=message.message_id
-            )
-            await asyncio.sleep(10)
-            try:
-                await error_msg.delete()
-            except Exception as e:
-                logger.warning(f"Could not delete error message: {e}")
 
-
+# ──────────────────────────────────────────
+# APP FACTORY
+# ──────────────────────────────────────────
 def create_application() -> Application:
-    """Create and configure the bot application."""
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN environment variable is not set!")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Ініціалізуємо cookies один раз при старті
+    _init_cookies()
 
+    app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
 
     logger.info("Bot application created")
     logger.info("Supported platforms: Instagram, TikTok, Facebook")
-    logger.info("iPhone/iOS compatibility: ENABLED")
-    
+    logger.info(f"Cookies loaded: {_COOKIES_FILE is not None}")
+
     return app

@@ -17,7 +17,7 @@ import yt_dlp
 # ──────────────────────────────────────────
 # RATE LIMIT — per user (не глобальний!)
 # ──────────────────────────────────────────
-REQUEST_LIMIT = 20       # максимум запитів на юзера
+REQUEST_LIMIT = 50       # максимум запитів на юзера
 REQUEST_WINDOW = 3600    # за 1 годину (секунди)
 COOLDOWN_TIME  = 1800    # відпочинок 30 хв (секунди)
 
@@ -36,9 +36,6 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────
 INSTAGRAM_URL_PATTERN = re.compile(
     r'https?://(?:www\.)?instagram\.com/(?:reels?|p|tv)/[A-Za-z0-9_\-]+(?:/[^\s]*)?'
-)
-TIKTOK_URL_PATTERN = re.compile(
-    r'https?://(?:www\.|vm\.|vt\.|m\.)?tiktok\.com/(?:@[\w\.-]+/video/\d+|v/\d+\.html|[\w\-]+)(?:/[^\s]*)?'
 )
 FACEBOOK_URL_PATTERN = re.compile(
     r'https?://(?:www\.|m\.|web\.)?facebook\.com/(?:watch/?\?v=|[\w\-\.]+/videos/|share/[vr]/)[\d\w\-]+'
@@ -62,14 +59,13 @@ USER_AGENTS = [
 
 
 # ──────────────────────────────────────────
-# Cookies — читаємо один раз при старті
+# Cookies — тільки Instagram
 # ──────────────────────────────────────────
 _INSTAGRAM_COOKIES_FILE: str | None = None
-_TIKTOK_COOKIES_FILE:    str | None = None
 
 def _init_cookies() -> None:
-    """Записує cookies у файли один раз при старті."""
-    global _INSTAGRAM_COOKIES_FILE, _TIKTOK_COOKIES_FILE
+    """Записує cookies у файл один раз при старті."""
+    global _INSTAGRAM_COOKIES_FILE
 
     instagram_cookies = os.environ.get("INSTAGRAM_COOKIES", "")
     if instagram_cookies:
@@ -81,16 +77,6 @@ def _init_cookies() -> None:
     else:
         logger.warning("INSTAGRAM_COOKIES not set")
 
-    tiktok_cookies = os.environ.get("TIKTOK_COOKIES", "")
-    if tiktok_cookies:
-        path = "/tmp/tiktok_cookies.txt"
-        with open(path, "w") as f:
-            f.write(tiktok_cookies)
-        _TIKTOK_COOKIES_FILE = path
-        logger.info("TikTok cookies loaded from environment")
-    else:
-        logger.warning("TIKTOK_COOKIES not set — TikTok may fail without auth")
-
 
 # ──────────────────────────────────────────
 # URL EXTRACTOR
@@ -98,7 +84,6 @@ def _init_cookies() -> None:
 def extract_video_url(text: str) -> tuple[str, str] | None:
     for pattern, platform in [
         (INSTAGRAM_URL_PATTERN, "instagram"),
-        (TIKTOK_URL_PATTERN,    "tiktok"),
         (FACEBOOK_URL_PATTERN,  "facebook"),
     ]:
         match = pattern.search(text)
@@ -108,9 +93,13 @@ def extract_video_url(text: str) -> tuple[str, str] | None:
 
 
 # ──────────────────────────────────────────
-# DOWNLOADER
+# DOWNLOADER - підтримує відео та фото
 # ──────────────────────────────────────────
-def download_video(url: str, output_dir: str, platform: str) -> str | None:
+def download_media(url: str, output_dir: str, platform: str) -> tuple[str | None, str]:
+    """
+    Завантажує відео або фото.
+    Returns: (filepath, media_type) де media_type = 'video' або 'photo'
+    """
     output_template = os.path.join(output_dir, "%(id)s.%(ext)s")
     user_agent = random.choice(USER_AGENTS)
 
@@ -130,46 +119,15 @@ def download_video(url: str, output_dir: str, platform: str) -> str | None:
     if platform == "instagram":
         ydl_opts = {
             **base_opts,
-            # ✅ ФІКС: беремо готовий mp4 без злиття потоків → нема помилки ffmpeg merge
+            # ✅ ФІКС: беремо готовий mp4 без злиття потоків
             "format": "best[ext=mp4]/best",
             "merge_output_format": "mp4",
+            # Дозволяємо завантажувати фото
+            "writethumbnail": False,  # Не треба окремо thumbnail
         }
         if _INSTAGRAM_COOKIES_FILE:
             ydl_opts["cookiefile"] = _INSTAGRAM_COOKIES_FILE
             logger.info("Instagram: Using cookies")
-
-    elif platform == "tiktok":
-        ydl_opts = {
-            **base_opts,
-            "format": (
-                "best[ext=mp4][height<=1920]/"
-                "best[ext=mp4]/"
-                "bestvideo[ext=mp4]+bestaudio/"
-                "best"
-            ),
-            "merge_output_format": "mp4",
-            # ✅ ФІКС: для merger використовуємо copy щоб не перекодовувати
-            "postprocessor_args": {
-                "merger": ["-c", "copy"],
-            },
-            "http_headers": {
-                "User-Agent":              user_agent,
-                "Referer":                 "https://www.tiktok.com/",
-                "Accept":                  "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language":         "en-US,en;q=0.5",
-                "Accept-Encoding":         "gzip, deflate",
-                "Connection":              "keep-alive",
-                "Upgrade-Insecure-Requests": "1",
-            },
-            "nocheckcertificate": True,
-            "extractor_retries":  10,
-            "sleep_interval":     2,
-            "max_sleep_interval": 5,
-        }
-        if _TIKTOK_COOKIES_FILE:
-            ydl_opts["cookiefile"] = _TIKTOK_COOKIES_FILE
-            logger.info("TikTok: Using cookies")
-        logger.info("TikTok: Using aggressive anti-blocking mode")
 
     elif platform == "facebook":
         ydl_opts = {
@@ -201,9 +159,8 @@ def download_video(url: str, output_dir: str, platform: str) -> str | None:
         }
 
     try:
-        logger.info(f"Downloading {platform} video with yt-dlp...")
+        logger.info(f"Downloading {platform} media with yt-dlp...")
         logger.info(f"URL: {url}")
-        logger.info(f"Format: {ydl_opts.get('format', 'best')}")
 
         time.sleep(random.uniform(0.5, 2))
 
@@ -211,46 +168,73 @@ def download_video(url: str, output_dir: str, platform: str) -> str | None:
             info = ydl.extract_info(url, download=True)
             if info is None:
                 logger.error(f"{platform}: yt-dlp returned None")
-                return None
+                return None, 'unknown'
 
             logger.info(f"Title: {info.get('title', 'Unknown')}")
-            logger.info(f"Duration: {info.get('duration', 0)}s | Format: {info.get('format_id', '?')}")
+            
+            # Визначаємо тип медіа
+            media_type = 'video'
+            
+            # Перевірка чи це фото (Instagram posts можуть бути фото)
+            if platform == "instagram":
+                # Якщо немає відео кодека - це фото
+                if info.get('vcodec') == 'none' or not info.get('vcodec'):
+                    media_type = 'photo'
+                    logger.info("Detected: Photo/Image")
+                # Якщо дуже коротке і немає звуку - теж може бути фото
+                elif info.get('duration', 0) == 0 and info.get('acodec') == 'none':
+                    media_type = 'photo'
+                    logger.info("Detected: Static image")
+                else:
+                    logger.info(f"Detected: Video (duration: {info.get('duration', 0)}s)")
 
             filename = ydl.prepare_filename(info)
             base = Path(filename).stem
 
-            # Шукаємо файл за stem
+            # Шукаємо файл (відео або фото)
+            valid_video_exts = (".mp4", ".mov", ".mkv", ".webm")
+            valid_photo_exts = (".jpg", ".jpeg", ".png", ".webp")
+            valid_exts = valid_video_exts + valid_photo_exts
+
             for f in Path(output_dir).iterdir():
-                if f.stem == base and f.suffix in (".mp4", ".mov", ".mkv", ".webm"):
+                if f.stem == base and f.suffix in valid_exts:
                     size_mb = f.stat().st_size / 1024 / 1024
                     logger.info(f"Found: {f.name} ({size_mb:.2f} MB)")
-                    return str(f)
+                    
+                    # Уточнюємо тип по розширенню
+                    if f.suffix in valid_photo_exts:
+                        media_type = 'photo'
+                    
+                    return str(f), media_type
 
-            # Fallback: перший відеофайл
+            # Fallback: перший медіа файл
             for f in Path(output_dir).iterdir():
-                if f.suffix in (".mp4", ".mov", ".mkv", ".webm"):
+                if f.suffix in valid_exts:
                     logger.info(f"Fallback file: {f.name}")
-                    return str(f)
+                    if f.suffix in valid_photo_exts:
+                        media_type = 'photo'
+                    return str(f), media_type
 
-            logger.error("No video file found in output directory")
-            return None
+            logger.error("No media file found in output directory")
+            return None, 'unknown'
 
     except yt_dlp.utils.DownloadError as e:
         logger.error(f"yt-dlp DownloadError [{platform}]: {e}")
-        return None
+        return None, 'unknown'
     except Exception as e:
         logger.error(f"yt-dlp error [{platform}]: {e}", exc_info=True)
-        return None
+        return None, 'unknown'
 
 
 # ──────────────────────────────────────────
 # TYPING INDICATOR — постійний під час завантаження
 # ──────────────────────────────────────────
-async def keep_uploading_action(chat_id: int, bot) -> None:
-    """Надсилає 'upload_video' кожні 4 секунди поки не скасовано."""
+async def keep_uploading_action(chat_id: int, bot, media_type: str = 'video') -> None:
+    """Надсилає typing action кожні 4 секунди поки не скасовано."""
+    action = "upload_video" if media_type == 'video' else "upload_photo"
     try:
         while True:
-            await bot.send_chat_action(chat_id=chat_id, action="upload_video")
+            await bot.send_chat_action(chat_id=chat_id, action=action)
             await asyncio.sleep(4)
     except asyncio.CancelledError:
         pass
@@ -318,22 +302,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     video_url, platform = video_info
     logger.info(f"Processing {platform.upper()} URL: {video_url} | user_id={user_id}")
 
-    # ✅ Постійний індикатор завантаження
+    # Запускаємо typing indicator (поки не знаємо тип медіа, ставимо video)
     typing_task = asyncio.create_task(
-        keep_uploading_action(message.chat_id, context.bot)
+        keep_uploading_action(message.chat_id, context.bot, 'video')
     )
 
     try:
         with tempfile.TemporaryDirectory() as tmp_dir:
-            video_path = await asyncio.get_event_loop().run_in_executor(
-                None, download_video, video_url, tmp_dir, platform
+            media_path, media_type = await asyncio.get_event_loop().run_in_executor(
+                None, download_media, video_url, tmp_dir, platform
             )
 
-            if not video_path or not Path(video_path).exists():
+            if not media_path or not Path(media_path).exists():
                 logger.warning(f"Failed to download {platform}: {video_url}")
                 err = await message.reply_text(
-                    f"❌ Не вдалося завантажити відео з {platform.title()}.\n"
-                    f"Можливо, воно приватне або недоступне.",
+                    f"❌ Не вдалося завантажити з {platform.title()}.\n"
+                    f"Можливо, контент приватний або недоступний.",
                     reply_to_message_id=message.message_id
                 )
                 await asyncio.sleep(10)
@@ -343,10 +327,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     pass
                 return
 
-            file_size = Path(video_path).stat().st_size
+            file_size = Path(media_path).stat().st_size
             if file_size > 50 * 1024 * 1024:
                 err = await message.reply_text(
-                    f"❌ Відео завелике для відправки (понад 50 МБ).",
+                    f"❌ Файл завеликий для відправки (понад 50 МБ).",
                     reply_to_message_id=message.message_id
                 )
                 await asyncio.sleep(10)
@@ -356,22 +340,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     pass
                 return
 
+            # Оновлюємо typing action відповідно до типу медіа
+            typing_task.cancel()
+            typing_task = asyncio.create_task(
+                keep_uploading_action(message.chat_id, context.bot, media_type)
+            )
+
             try:
-                with open(video_path, "rb") as video_file:
-                    await context.bot.send_video(
-                        chat_id=message.chat_id,
-                        video=video_file,
-                        supports_streaming=True
-                    )
+                with open(media_path, "rb") as media_file:
+                    if media_type == 'photo':
+                        # Надсилаємо як фото
+                        await context.bot.send_photo(
+                            chat_id=message.chat_id,
+                            photo=media_file
+                        )
+                        logger.info(f"Sent as photo: {Path(media_path).name}")
+                    else:
+                        # Надсилаємо як відео
+                        await context.bot.send_video(
+                            chat_id=message.chat_id,
+                            video=media_file,
+                            supports_streaming=True
+                        )
+                        logger.info(f"Sent as video: {Path(media_path).name}")
+                
                 try:
                     await message.delete()
                 except Exception as e:
                     logger.warning(f"Could not delete original message: {e}")
 
             except Exception as e:
-                logger.error(f"Failed to send video [{platform}]: {e}")
+                logger.error(f"Failed to send media [{platform}]: {e}")
                 err = await message.reply_text(
-                    f"❌ Помилка при відправці відео. Спробуйте пізніше.",
+                    f"❌ Помилка при відправці. Спробуйте пізніше.",
                     reply_to_message_id=message.message_id
                 )
                 await asyncio.sleep(10)
@@ -399,8 +400,7 @@ def create_application() -> Application:
     )
 
     logger.info("Bot application created")
-    logger.info("Supported platforms: Instagram, TikTok, Facebook")
+    logger.info("Supported platforms: Instagram (video + photo), Facebook")
     logger.info(f"Instagram cookies: {_INSTAGRAM_COOKIES_FILE is not None}")
-    logger.info(f"TikTok cookies: {_TIKTOK_COOKIES_FILE is not None}")
 
     return app

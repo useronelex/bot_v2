@@ -13,6 +13,8 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 import yt_dlp
 
+from instagram_client import download_instagram_media, is_available as instagrapi_available
+
 
 # ──────────────────────────────────────────
 # RATE LIMIT — per user
@@ -65,7 +67,6 @@ _INSTAGRAM_COOKIES_FILE: str | None = None
 
 def _init_cookies() -> None:
     global _INSTAGRAM_COOKIES_FILE
-
     instagram_cookies = os.environ.get("INSTAGRAM_COOKIES", "")
     if instagram_cookies:
         path = "/tmp/instagram_cookies.txt"
@@ -92,68 +93,14 @@ def extract_url(text: str) -> tuple[str, str] | None:
 
 
 # ──────────────────────────────────────────
-# PHOTO FALLBACK — Instagram фото пости
-# ──────────────────────────────────────────
-def _download_photo_fallback(url: str, output_dir: str, base_opts: dict) -> tuple[str | None, str]:
-    """Завантажує фото коли yt-dlp каже 'There is no video in this post'."""
-    logger.info("Instagram photo post detected — trying photo fallback...")
-
-    # Спроба 1: завантажити напряму (yt-dlp вміє качати фото як файл)
-    photo_opts = {
-        **base_opts,
-        "format": "best",
-        "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
-    }
-    if _INSTAGRAM_COOKIES_FILE:
-        photo_opts["cookiefile"] = _INSTAGRAM_COOKIES_FILE
-
-    try:
-        with yt_dlp.YoutubeDL(photo_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-
-        # Шукаємо будь-який медіа файл
-        for f in Path(output_dir).iterdir():
-            if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov"):
-                media_type = "photo" if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp") else "video"
-                logger.info(f"Photo fallback [{media_type}]: {f.name}")
-                return str(f), media_type
-
-    except Exception as e:
-        logger.warning(f"Photo fallback attempt 1 failed: {e}")
-
-    # Спроба 2: витягнути пряме URL фото з metadata і завантажити через requests
-    try:
-        info_opts = {**base_opts, "skip_download": True}
-        if _INSTAGRAM_COOKIES_FILE:
-            info_opts["cookiefile"] = _INSTAGRAM_COOKIES_FILE
-
-        with yt_dlp.YoutubeDL(info_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-
-        if info:
-            # Шукаємо thumbnail або пряме URL зображення
-            thumbnail_url = info.get("thumbnail") or info.get("url")
-            if thumbnail_url:
-                import urllib.request
-                photo_path = os.path.join(output_dir, "photo.jpg")
-                urllib.request.urlretrieve(thumbnail_url, photo_path)
-                if Path(photo_path).exists() and Path(photo_path).stat().st_size > 0:
-                    logger.info(f"Photo fallback via thumbnail URL: {Path(photo_path).stat().st_size / 1024:.0f} KB")
-                    return photo_path, "photo"
-
-    except Exception as e:
-        logger.error(f"Photo fallback attempt 2 failed: {e}")
-
-    logger.error("All photo fallback attempts failed")
-    return None, "unknown"
-
-
-# ──────────────────────────────────────────
 # DOWNLOADER
 # ──────────────────────────────────────────
 def download_media(url: str, output_dir: str, platform: str) -> tuple[str | None, str]:
-    """Завантажує відео або фото. Returns: (filepath, 'video'|'photo'|'unknown')"""
-
+    """
+    Завантажує медіа через yt-dlp.
+    Якщо Instagram повертає 'There is no video' — fallback на instagrapi.
+    Returns: (filepath, 'video'|'photo'|'unknown')
+    """
     output_template = os.path.join(output_dir, "%(id)s.%(ext)s")
     user_agent = random.choice(USER_AGENTS)
 
@@ -165,9 +112,7 @@ def download_media(url: str, output_dir: str, platform: str) -> tuple[str | None
         "retries":          10,
         "fragment_retries": 10,
         "max_filesize":     50 * 1024 * 1024,
-        "http_headers": {
-            "User-Agent": user_agent,
-        },
+        "http_headers": {"User-Agent": user_agent},
     }
 
     if platform == "instagram":
@@ -190,9 +135,7 @@ def download_media(url: str, output_dir: str, platform: str) -> tuple[str | None
                 "best"
             ),
             "merge_output_format": "mp4",
-            "postprocessor_args": {
-                "merger": ["-c", "copy"],
-            },
+            "postprocessor_args": {"merger": ["-c", "copy"]},
             "http_headers": {
                 "User-Agent":      user_agent,
                 "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -207,7 +150,7 @@ def download_media(url: str, output_dir: str, platform: str) -> tuple[str | None
         return None, "unknown"
 
     try:
-        logger.info(f"Downloading {platform} media | URL: {url}")
+        logger.info(f"Downloading {platform} | URL: {url}")
         time.sleep(random.uniform(0.5, 2))
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -225,14 +168,13 @@ def download_media(url: str, output_dir: str, platform: str) -> tuple[str | None
             valid_photo_exts = (".jpg", ".jpeg", ".png", ".webp")
             all_exts = valid_video_exts + valid_photo_exts
 
-            # Шукаємо файл за stem
             for f in Path(output_dir).iterdir():
                 if f.stem == base and f.suffix.lower() in all_exts:
                     media_type = "photo" if f.suffix.lower() in valid_photo_exts else "video"
                     logger.info(f"Found [{media_type}]: {f.name} ({f.stat().st_size / 1024 / 1024:.2f} MB)")
                     return str(f), media_type
 
-            # Fallback: перший медіа файл у директорії
+            # Fallback: перший медіа файл
             for f in Path(output_dir).iterdir():
                 if f.suffix.lower() in all_exts:
                     media_type = "photo" if f.suffix.lower() in valid_photo_exts else "video"
@@ -243,9 +185,10 @@ def download_media(url: str, output_dir: str, platform: str) -> tuple[str | None
             return None, "unknown"
 
     except yt_dlp.utils.DownloadError as e:
-        # Instagram фото пост — перемикаємось на thumbnail fallback
+        # yt-dlp не вміє качати фото пости/каруселі — передаємо instagrapi
         if "There is no video in this post" in str(e):
-            return _download_photo_fallback(url, output_dir, base_opts)
+            logger.info("yt-dlp: photo/album post — switching to instagrapi fallback")
+            return _instagrapi_fallback(url, output_dir)
 
         logger.error(f"DownloadError [{platform}]: {e}")
         return None, "unknown"
@@ -253,6 +196,19 @@ def download_media(url: str, output_dir: str, platform: str) -> tuple[str | None
     except Exception as e:
         logger.error(f"Unexpected error [{platform}]: {e}", exc_info=True)
         return None, "unknown"
+
+
+def _instagrapi_fallback(url: str, output_dir: str) -> tuple[str | None, str]:
+    """Fallback на instagrapi для фото постів і каруселей."""
+    if not instagrapi_available():
+        logger.error(
+            "instagrapi fallback not available. "
+            "Set INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD in environment variables."
+        )
+        return None, "unknown"
+
+    logger.info("Switching to instagrapi for photo/album download...")
+    return download_instagram_media(url, output_dir)
 
 
 # ──────────────────────────────────────────
@@ -310,7 +266,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if not allowed:
         err = await message.reply_text(
-            f"⏳ Забагато запитів. Спробуй через {cooldown_mins} хв.",
+            f"Забагато запитів. Спробуй через {cooldown_mins} хв.",
             reply_to_message_id=message.message_id
         )
         await asyncio.sleep(10)
@@ -337,7 +293,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if not media_path or not Path(media_path).exists():
                 logger.warning(f"Download failed [{platform}]: {media_url}")
                 err = await message.reply_text(
-                    f"❌ Не вдалося завантажити з {platform.title()}.\n"
+                    f"Не вдалося завантажити з {platform.title()}.\n"
                     f"Можливо, контент приватний або недоступний.",
                     reply_to_message_id=message.message_id
                 )
@@ -351,7 +307,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             # Файл завеликий
             if Path(media_path).stat().st_size > 50 * 1024 * 1024:
                 err = await message.reply_text(
-                    "❌ Файл завеликий для відправки (понад 50 МБ).",
+                    "Файл завеликий для відправки (понад 50 МБ).",
                     reply_to_message_id=message.message_id
                 )
                 await asyncio.sleep(10)
@@ -361,7 +317,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     pass
                 return
 
-            # Оновлюємо typing під реальний тип медіа
+            # Оновлюємо typing під реальний тип
             typing_task.cancel()
             typing_task = asyncio.create_task(
                 keep_uploading_action(message.chat_id, context.bot, media_type)
@@ -381,7 +337,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         )
                         logger.info(f"Sent video: {Path(media_path).name}")
 
-                # Видаляємо оригінальне повідомлення
                 try:
                     await message.delete()
                 except Exception as e:
@@ -390,7 +345,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             except Exception as e:
                 logger.error(f"Send failed [{platform}]: {e}")
                 err = await message.reply_text(
-                    "❌ Помилка при відправці. Спробуйте пізніше.",
+                    "Помилка при відправці. Спробуйте пізніше.",
                     reply_to_message_id=message.message_id
                 )
                 await asyncio.sleep(10)
@@ -416,7 +371,8 @@ def create_application() -> Application:
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
 
-    logger.info("Bot started | Platforms: Instagram (video + photo), Facebook")
-    logger.info(f"Instagram cookies: {_INSTAGRAM_COOKIES_FILE is not None}")
+    logger.info("Bot started | Platforms: Instagram (video + photo + album), Facebook")
+    logger.info(f"yt-dlp cookies: {_INSTAGRAM_COOKIES_FILE is not None}")
+    logger.info(f"instagrapi fallback: {instagrapi_available()}")
 
     return app

@@ -95,13 +95,13 @@ def extract_url(text: str) -> tuple[str, str] | None:
 # PHOTO FALLBACK — Instagram фото пости
 # ──────────────────────────────────────────
 def _download_photo_fallback(url: str, output_dir: str, base_opts: dict) -> tuple[str | None, str]:
-    """Завантажує фото через thumbnail коли yt-dlp каже 'There is no video in this post'."""
-    logger.info("Instagram photo post detected — trying thumbnail fallback...")
+    """Завантажує фото коли yt-dlp каже 'There is no video in this post'."""
+    logger.info("Instagram photo post detected — trying photo fallback...")
 
+    # Спроба 1: завантажити напряму (yt-dlp вміє качати фото як файл)
     photo_opts = {
         **base_opts,
-        "skip_download": True,
-        "writethumbnail": True,
+        "format": "best",
         "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
     }
     if _INSTAGRAM_COOKIES_FILE:
@@ -109,19 +109,43 @@ def _download_photo_fallback(url: str, output_dir: str, base_opts: dict) -> tupl
 
     try:
         with yt_dlp.YoutubeDL(photo_opts) as ydl:
-            ydl.extract_info(url, download=True)
+            info = ydl.extract_info(url, download=True)
 
+        # Шукаємо будь-який медіа файл
         for f in Path(output_dir).iterdir():
-            if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
-                logger.info(f"Photo found: {f.name} ({f.stat().st_size / 1024 / 1024:.2f} MB)")
-                return str(f), "photo"
-
-        logger.error("Photo fallback: no image file found")
-        return None, "unknown"
+            if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov"):
+                media_type = "photo" if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp") else "video"
+                logger.info(f"Photo fallback [{media_type}]: {f.name}")
+                return str(f), media_type
 
     except Exception as e:
-        logger.error(f"Photo fallback failed: {e}")
-        return None, "unknown"
+        logger.warning(f"Photo fallback attempt 1 failed: {e}")
+
+    # Спроба 2: витягнути пряме URL фото з metadata і завантажити через requests
+    try:
+        info_opts = {**base_opts, "skip_download": True}
+        if _INSTAGRAM_COOKIES_FILE:
+            info_opts["cookiefile"] = _INSTAGRAM_COOKIES_FILE
+
+        with yt_dlp.YoutubeDL(info_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        if info:
+            # Шукаємо thumbnail або пряме URL зображення
+            thumbnail_url = info.get("thumbnail") or info.get("url")
+            if thumbnail_url:
+                import urllib.request
+                photo_path = os.path.join(output_dir, "photo.jpg")
+                urllib.request.urlretrieve(thumbnail_url, photo_path)
+                if Path(photo_path).exists() and Path(photo_path).stat().st_size > 0:
+                    logger.info(f"Photo fallback via thumbnail URL: {Path(photo_path).stat().st_size / 1024:.0f} KB")
+                    return photo_path, "photo"
+
+    except Exception as e:
+        logger.error(f"Photo fallback attempt 2 failed: {e}")
+
+    logger.error("All photo fallback attempts failed")
+    return None, "unknown"
 
 
 # ──────────────────────────────────────────

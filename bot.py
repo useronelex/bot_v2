@@ -13,8 +13,6 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 import yt_dlp
 
-from instagram_client import download_instagram_media, is_available as instagrapi_available
-
 
 # ──────────────────────────────────────────
 # RATE LIMIT — per user
@@ -185,10 +183,10 @@ def download_media(url: str, output_dir: str, platform: str) -> tuple[str | None
             return None, "unknown"
 
     except yt_dlp.utils.DownloadError as e:
-        # yt-dlp не вміє качати фото пости/каруселі — передаємо instagrapi
+        # Фото пости і каруселі не підтримуються
         if "There is no video in this post" in str(e):
-            logger.info("yt-dlp: photo/album post — switching to instagrapi fallback")
-            return _instagrapi_fallback(url, output_dir)
+            logger.info("Photo/album post — not supported")
+            return None, "photo_not_supported"
 
         logger.error(f"DownloadError [{platform}]: {e}")
         return None, "unknown"
@@ -197,18 +195,6 @@ def download_media(url: str, output_dir: str, platform: str) -> tuple[str | None
         logger.error(f"Unexpected error [{platform}]: {e}", exc_info=True)
         return None, "unknown"
 
-
-def _instagrapi_fallback(url: str, output_dir: str) -> tuple[str | None, str]:
-    """Fallback на instagrapi для фото постів і каруселей."""
-    if not instagrapi_available():
-        logger.error(
-            "instagrapi fallback not available. "
-            "Set INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD in environment variables."
-        )
-        return None, "unknown"
-
-    logger.info("Switching to instagrapi for photo/album download...")
-    return download_instagram_media(url, output_dir)
 
 
 # ──────────────────────────────────────────
@@ -292,11 +278,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             # Не вдалось завантажити
             if not media_path or not Path(media_path).exists():
                 logger.warning(f"Download failed [{platform}]: {media_url}")
-                err = await message.reply_text(
-                    f"Не вдалося завантажити з {platform.title()}.\n"
-                    f"Можливо, контент приватний або недоступний.",
-                    reply_to_message_id=message.message_id
-                )
+
+                if media_type == "photo_not_supported":
+                    text = "Фото пости та каруселі не підтримуються.\nНадішли посилання на Reels або відео."
+                else:
+                    text = f"Не вдалося завантажити з {platform.title()}.\nМожливо, контент приватний або недоступний."
+
+                err = await message.reply_text(text, reply_to_message_id=message.message_id)
                 await asyncio.sleep(10)
                 try:
                     await err.delete()
@@ -371,8 +359,7 @@ def create_application() -> Application:
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
 
-    logger.info("Bot started | Platforms: Instagram (video + photo + album), Facebook")
-    logger.info(f"yt-dlp cookies: {_INSTAGRAM_COOKIES_FILE is not None}")
-    logger.info(f"instagrapi fallback: {instagrapi_available()}")
+    logger.info("Bot started | Platforms: Instagram (Reels/video), Facebook")
+    logger.info(f"Instagram cookies: {_INSTAGRAM_COOKIES_FILE is not None}")
 
     return app

@@ -135,58 +135,97 @@ def extract_url(text: str) -> tuple[str, str, str] | None:
 
 # ──────────────────────────────────────────
 # МЕТОД 1: Зовнішній сервіс (для публічного контенту)
-# Використовуємо публічне API SaveFrom / SnapSave
-# Це швидко, не навантажує наш акаунт, не потребує cookies
-# АЛЕ: не працює для приватного, сторіз, 18+
+# Пробуємо декілька сервісів по черзі — якщо один впав, йдемо до наступного
 # ──────────────────────────────────────────
 def _try_external_service(url: str, output_dir: str) -> str | None:
     """
-    Спроба завантажити через зовнішній сервіс.
-    Повертає шлях до файлу або None якщо не вдалося.
+    Пробуємо декілька публічних сервісів по черзі.
+    Кожен може впасти або змінити API — тому каскад і тут.
     """
+    # Сервіс 1: igram.world — стабільний, JSON API
+    result = _try_igram(url, output_dir)
+    if result:
+        return result
+
+    # Сервіс 2: instafinsta як резерв
+    result = _try_instafinsta(url, output_dir)
+    if result:
+        return result
+
+    return None
+
+
+def _try_igram(url: str, output_dir: str) -> str | None:
+    """igram.world — надійний публічний downloader з JSON відповіддю."""
     try:
-        # SnapSave має публічний endpoint який добре працює з Instagram
-        api_url = "https://snapsave.app/action.php"
-        payload = {"url": url}
+        api_url = "https://igram.world/api/convert"
         headers = {
             "User-Agent": random.choice(USER_AGENTS),
-            "Referer": "https://snapsave.app/",
-            "Origin": "https://snapsave.app",
+            "Referer": "https://igram.world/",
+            "Origin": "https://igram.world",
             "Content-Type": "application/x-www-form-urlencoded",
+            "X-Requested-With": "XMLHttpRequest",
         }
-
-        # curl_cffi з імперсонацією Chrome — виглядає як реальний браузер
         resp = cffi_requests.post(
             api_url,
-            data=payload,
+            data={"url": url, "lang": "en"},
             headers=headers,
-            impersonate="chrome110",  # точний TLS fingerprint Chrome 110
+            impersonate="chrome110",
             timeout=15,
         )
-
         if resp.status_code != 200:
-            logger.info(f"External service returned {resp.status_code}")
+            logger.info(f"igram returned {resp.status_code}")
             return None
 
         data = resp.json()
+        # igram повертає список медіа — шукаємо відео
+        items = data if isinstance(data, list) else data.get("media", [])
+        for item in items:
+            src = item.get("url") or item.get("src", "")
+            if src and ("mp4" in src or item.get("type", "") == "video"):
+                logger.info("igram.world succeeded")
+                return _download_direct_url(src, output_dir, use_proxy=False)
 
-        # SnapSave повертає масив посилань — беремо перше відео
-        links = data.get("data", [])
-        video_url = None
-        for link in links:
-            if link.get("type") == "mp4" or ".mp4" in link.get("url", ""):
-                video_url = link.get("url")
-                break
+        logger.info("igram: no video in response")
+        return None
+    except Exception as e:
+        logger.info(f"igram failed: {e}")
+        return None
 
-        if not video_url:
-            logger.info("External service: no video URL in response")
+
+def _try_instafinsta(url: str, output_dir: str) -> str | None:
+    """instafinsta.com як резервний варіант."""
+    try:
+        api_url = "https://instafinsta.com/wp-json/aio-dl/video-data/"
+        headers = {
+            "User-Agent": random.choice(USER_AGENTS),
+            "Referer": "https://instafinsta.com/",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        resp = cffi_requests.post(
+            api_url,
+            data={"url": url, "token": ""},
+            headers=headers,
+            impersonate="chrome110",
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            logger.info(f"instafinsta returned {resp.status_code}")
             return None
 
-        # Завантажуємо відео за прямим посиланням
-        return _download_direct_url(video_url, output_dir, use_proxy=False)
+        data = resp.json()
+        medias = data.get("medias", [])
+        for media in medias:
+            if media.get("extension") == "mp4":
+                video_url = media.get("url")
+                if video_url:
+                    logger.info("instafinsta succeeded")
+                    return _download_direct_url(video_url, output_dir, use_proxy=False)
 
+        logger.info("instafinsta: no video in response")
+        return None
     except Exception as e:
-        logger.info(f"External service failed: {e}")
+        logger.info(f"instafinsta failed: {e}")
         return None
 
 
@@ -238,21 +277,30 @@ def _try_instagram_api(url: str, output_dir: str, content_type: str) -> str | No
 
 def _download_post(session, shortcode: str, output_dir: str, proxies: dict) -> str | None:
     """
-    Отримуємо медіа-інфо через Instagram GraphQL API.
-    Це той самий endpoint що використовує веб-версія Instagram.
-    """
-    # GraphQL запит — офіційний внутрішній API Instagram
-    api_url = f"https://www.instagram.com/api/v1/media/{shortcode}/info/"
+    Отримуємо медіа через Instagram GraphQL API.
 
-    # Альтернативний endpoint через oEmbed (публічний, не потребує авторизації для публічного)
-    oembed_url = f"https://www.instagram.com/p/{shortcode}/?__a=1&__d=dis"
+    Чому GraphQL, а не ?__a=1?
+    Endpoint __a=1 Instagram відключив ще у 2022 — він повертає 404 майже завжди.
+    GraphQL endpoint /graphql/query/ — це те що реально використовує веб-версія
+    Instagram при відкритті поста. Він потребує правильного X-IG-App-ID і cookies.
+    """
+    # Це офіційний GraphQL запит який відправляє браузер при відкритті поста
+    graphql_url = "https://www.instagram.com/graphql/query/"
+
+    # doc_id — це внутрішній ID GraphQL запиту Instagram для отримання медіа поста
+    # Значення стабільне і не змінюється часто
+    params = {
+        "doc_id": "8845758582119845",
+        "variables": json.dumps({"shortcode": shortcode, "fetch_tagged_user_count": None}),
+    }
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
-        "X-IG-App-ID": "936619743392459",  # офіційний App ID веб-версії Instagram
-        "X-Requested-With": "XMLHttpRequest",
+        "X-IG-App-ID": "936619743392459",
+        "X-FB-Friendly-Name": "PolarisPostActionLoadPostQueryQuery",
+        "X-CSRFToken": session.cookies.get("csrftoken", ""),
         "Referer": f"https://www.instagram.com/p/{shortcode}/",
         "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors",
@@ -260,7 +308,8 @@ def _download_post(session, shortcode: str, output_dir: str, proxies: dict) -> s
     }
 
     resp = session.get(
-        oembed_url,
+        graphql_url,
+        params=params,
         headers=headers,
         impersonate="chrome110",
         proxies=proxies or None,
@@ -268,24 +317,73 @@ def _download_post(session, shortcode: str, output_dir: str, proxies: dict) -> s
     )
 
     if resp.status_code != 200:
-        logger.warning(f"Post API returned {resp.status_code} for {shortcode}")
-        return None
+        logger.warning(f"GraphQL returned {resp.status_code} for {shortcode}")
+        # Спробуємо запасний endpoint — прямий API медіа
+        return _download_post_fallback(session, shortcode, output_dir, proxies)
 
     try:
         data = resp.json()
     except Exception:
-        logger.warning("Post API: invalid JSON response")
-        return None
+        logger.warning("GraphQL: invalid JSON response")
+        return _download_post_fallback(session, shortcode, output_dir, proxies)
 
-    # Знаходимо URL відео в структурі відповіді
-    items = data.get("items", [data.get("graphql", {}).get("shortcode_media", {})])
-    for item in items:
-        video_url = item.get("video_url")
+    # Навігація по структурі GraphQL відповіді
+    try:
+        media = data["data"]["xdt_shortcode_media"]
+        video_url = media.get("video_url")
         if video_url:
-            logger.info(f"Found video URL for post {shortcode}")
+            logger.info(f"GraphQL: found video for {shortcode}")
             return _download_direct_url(video_url, output_dir, use_proxy=bool(proxies), proxies=proxies)
 
-    logger.info(f"No video URL found for post {shortcode} (може бути фото)")
+        # Може бути карусель (кілька медіа в одному пості)
+        edges = media.get("edge_sidecar_to_children", {}).get("edges", [])
+        for edge in edges:
+            node = edge.get("node", {})
+            if node.get("is_video") and node.get("video_url"):
+                logger.info(f"GraphQL: found carousel video for {shortcode}")
+                return _download_direct_url(node["video_url"], output_dir, use_proxy=bool(proxies), proxies=proxies)
+
+    except (KeyError, TypeError):
+        pass
+
+    logger.info(f"GraphQL: no video for {shortcode} — можливо це фото")
+    return None
+
+
+def _download_post_fallback(session, shortcode: str, output_dir: str, proxies: dict) -> str | None:
+    """
+    Запасний метод: прямий API endpoint Instagram.
+    Використовується якщо GraphQL не відповів.
+    """
+    try:
+        # Цей endpoint використовує мобільний додаток Instagram
+        url = f"https://www.instagram.com/api/v1/media/{shortcode}/info/"
+        headers = {
+            "User-Agent": "Instagram 275.0.0.27.98 Android",  # мобільний UA
+            "X-IG-App-ID": "567067343352427",  # App ID мобільного додатку
+        }
+        resp = session.get(
+            url,
+            headers=headers,
+            impersonate="chrome110",
+            proxies=proxies or None,
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            logger.warning(f"Post fallback API returned {resp.status_code}")
+            return None
+
+        data = resp.json()
+        items = data.get("items", [])
+        for item in items:
+            # Відео версії відсортовані від найкращої якості
+            video_versions = item.get("video_versions", [])
+            if video_versions:
+                video_url = video_versions[0]["url"]
+                logger.info(f"Post fallback: found video for {shortcode}")
+                return _download_direct_url(video_url, output_dir, use_proxy=bool(proxies), proxies=proxies)
+    except Exception as e:
+        logger.warning(f"Post fallback failed: {e}")
     return None
 
 
@@ -343,8 +441,13 @@ def _download_story(session, username: str, media_id: str, output_dir: str, prox
         items = reel.get("items", [])
 
         # Знаходимо конкретну сторіз за media_id
+        # Instagram іноді повертає складений ID типу "3871424810811404248_123456789"
+        # тому перевіряємо чи ID починається з потрібного числа
         for item in items:
-            if str(item.get("pk", "")) == media_id or str(item.get("id", "")).startswith(media_id):
+            item_pk = str(item.get("pk", ""))
+            item_id = str(item.get("id", ""))
+            # Співпадіння якщо pk == media_id АБО id починається з media_id
+            if item_pk == media_id or item_id == media_id or item_id.startswith(f"{media_id}_"):
                 if item.get("media_type") == 2:  # 2 = відео в Instagram API
                     # Беремо відео найкращої якості
                     video_versions = item.get("video_versions", [])

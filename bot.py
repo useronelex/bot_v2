@@ -1,26 +1,25 @@
 import os
 import re
+import json
 import logging
 import asyncio
 import tempfile
 import random
 import time
-
 from collections import deque
 from pathlib import Path
-
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
-import yt_dlp
 
+# curl_cffi імітує точний TLS-fingerprint Chrome — Instagram не відрізняє від браузера
+from curl_cffi import requests as cffi_requests
 
 # ──────────────────────────────────────────
-# RATE LIMIT — per user
+# RATE LIMIT — per user (без змін)
 # ──────────────────────────────────────────
-REQUEST_LIMIT = 50
+REQUEST_LIMIT  = 50
 REQUEST_WINDOW = 3600   # 1 година
 COOLDOWN_TIME  = 1800   # 30 хв
-
 user_timestamps: dict[int, deque] = {}
 user_cooldowns:  dict[int, float] = {}
 
@@ -30,12 +29,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 # ──────────────────────────────────────────
-# URL PATTERNS
+# URL PATTERNS — додано сторіз
 # ──────────────────────────────────────────
-INSTAGRAM_URL_PATTERN = re.compile(
-    r'https?://(?:www\.)?instagram\.com/(?:reels?|p|tv)/[A-Za-z0-9_\-]+(?:/[^\s]*)?'
+# Покриває: /p/ /reel/ /reels/ /tv/ — пости та відео
+INSTAGRAM_POST_PATTERN = re.compile(
+    r'https?://(?:www\.)?instagram\.com/(?:reels?|p|tv)/([A-Za-z0-9_\-]+)(?:/[^\s]*)?'
+)
+# Покриває: /stories/username/media_id/
+INSTAGRAM_STORY_PATTERN = re.compile(
+    r'https?://(?:www\.)?instagram\.com/stories/([A-Za-z0-9_\.]+)/(\d+)(?:/[^\s]*)?'
 )
 FACEBOOK_URL_PATTERN = re.compile(
     r'https?://(?:www\.|m\.|web\.)?facebook\.com/(?:watch/?\?v=|[\w\-\.]+/videos/|share/[vr]/)[\d\w\-]+'
@@ -44,9 +47,12 @@ FACEBOOK_URL_PATTERN = re.compile(
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 
+# Residential proxy — якщо є в env, використовуємо для Instagram запитів
+# Формат: "http://user:pass@host:port"
+RESIDENTIAL_PROXY = os.environ.get("RESIDENTIAL_PROXY", "")
 
 # ──────────────────────────────────────────
-# USER AGENTS
+# USER AGENTS (без змін)
 # ──────────────────────────────────────────
 USER_AGENTS = [
     "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
@@ -57,148 +63,432 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 ]
 
-
 # ──────────────────────────────────────────
-# COOKIES — один раз при старті
+# COOKIES — парсимо з env у словник
 # ──────────────────────────────────────────
-_INSTAGRAM_COOKIES_FILE: str | None = None
+_INSTAGRAM_COOKIES: dict = {}
 
 def _init_cookies() -> None:
-    global _INSTAGRAM_COOKIES_FILE
-    instagram_cookies = os.environ.get("INSTAGRAM_COOKIES", "")
-    if instagram_cookies:
-        path = "/tmp/instagram_cookies.txt"
-        with open(path, "w") as f:
-            f.write(instagram_cookies)
-        _INSTAGRAM_COOKIES_FILE = path
-        logger.info("Instagram cookies loaded from environment")
+    """
+    Завантажує cookies з env-змінної.
+    Підтримує два формати:
+      1. Netscape/cookies.txt (рядки з табуляцією) — як використовував yt-dlp
+      2. JSON: {"sessionid": "...", "csrftoken": "...", ...}
+    """
+    global _INSTAGRAM_COOKIES
+    raw = os.environ.get("INSTAGRAM_COOKIES", "").strip()
+    if not raw:
+        logger.warning("INSTAGRAM_COOKIES not set — приватний контент недоступний")
+        return
+
+    # Спроба розпарсити як JSON
+    if raw.startswith("{"):
+        try:
+            _INSTAGRAM_COOKIES = json.loads(raw)
+            logger.info(f"Instagram cookies loaded from JSON ({len(_INSTAGRAM_COOKIES)} keys)")
+            return
+        except json.JSONDecodeError:
+            pass
+
+    # Парсимо Netscape cookies.txt формат (той самий файл що використовував yt-dlp)
+    cookies = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 7:
+            # Формат: domain  flag  path  secure  expiry  name  value
+            name, value = parts[5], parts[6]
+            cookies[name] = value
+
+    if cookies:
+        _INSTAGRAM_COOKIES = cookies
+        logger.info(f"Instagram cookies loaded from Netscape format ({len(cookies)} cookies)")
     else:
-        logger.warning("INSTAGRAM_COOKIES not set")
+        logger.warning("Could not parse INSTAGRAM_COOKIES")
 
 
 # ──────────────────────────────────────────
-# URL EXTRACTOR
+# URL EXTRACTOR — тепер розрізняє тип контенту
 # ──────────────────────────────────────────
-def extract_url(text: str) -> tuple[str, str] | None:
-    for pattern, platform in [
-        (INSTAGRAM_URL_PATTERN, "instagram"),
-        (FACEBOOK_URL_PATTERN,  "facebook"),
-    ]:
-        match = pattern.search(text)
-        if match:
-            return (match.group(0), platform)
+def extract_url(text: str) -> tuple[str, str, str] | None:
+    """
+    Повертає (url, platform, content_type).
+    content_type: 'post' | 'story' | 'facebook'
+    """
+    # Спочатку перевіряємо сторіз (більш специфічний патерн)
+    match = INSTAGRAM_STORY_PATTERN.search(text)
+    if match:
+        return (match.group(0), "instagram", "story")
+
+    match = INSTAGRAM_POST_PATTERN.search(text)
+    if match:
+        return (match.group(0), "instagram", "post")
+
+    match = FACEBOOK_URL_PATTERN.search(text)
+    if match:
+        return (match.group(0), "facebook", "facebook")
+
     return None
 
 
 # ──────────────────────────────────────────
-# DOWNLOADER
+# МЕТОД 1: Зовнішній сервіс (для публічного контенту)
+# Використовуємо публічне API SaveFrom / SnapSave
+# Це швидко, не навантажує наш акаунт, не потребує cookies
+# АЛЕ: не працює для приватного, сторіз, 18+
 # ──────────────────────────────────────────
-def download_media(url: str, output_dir: str, platform: str) -> tuple[str | None, str]:
+def _try_external_service(url: str, output_dir: str) -> str | None:
     """
-    Завантажує медіа через yt-dlp.
-    Якщо Instagram повертає 'There is no video' — fallback на instagrapi.
-    Returns: (filepath, 'video'|'photo'|'unknown')
+    Спроба завантажити через зовнішній сервіс.
+    Повертає шлях до файлу або None якщо не вдалося.
     """
-    output_template = os.path.join(output_dir, "%(id)s.%(ext)s")
-    user_agent = random.choice(USER_AGENTS)
-
-    base_opts = {
-        "outtmpl":          output_template,
-        "quiet":            False,
-        "no_warnings":      False,
-        "socket_timeout":   30,
-        "retries":          10,
-        "fragment_retries": 10,
-        "max_filesize":     50 * 1024 * 1024,
-        "http_headers": {"User-Agent": user_agent},
-    }
-
-    if platform == "instagram":
-        ydl_opts = {
-            **base_opts,
-            "format": "best[ext=mp4]/best",
-            "merge_output_format": "mp4",
-        }
-        if _INSTAGRAM_COOKIES_FILE:
-            ydl_opts["cookiefile"] = _INSTAGRAM_COOKIES_FILE
-            logger.info("Instagram: Using cookies")
-
-    elif platform == "facebook":
-        ydl_opts = {
-            **base_opts,
-            "format": (
-                "best[ext=mp4][height<=1080]/"
-                "best[ext=mp4]/"
-                "bestvideo[ext=mp4]+bestaudio/"
-                "best"
-            ),
-            "merge_output_format": "mp4",
-            "postprocessor_args": {"merger": ["-c", "copy"]},
-            "http_headers": {
-                "User-Agent":      user_agent,
-                "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
-                "Sec-Fetch-Mode":  "navigate",
-            },
-        }
-        logger.info("Facebook: Using web scraping mode")
-
-    else:
-        logger.error(f"Unknown platform: {platform}")
-        return None, "unknown"
-
     try:
-        logger.info(f"Downloading {platform} | URL: {url}")
-        time.sleep(random.uniform(0.5, 2))
+        # SnapSave має публічний endpoint який добре працює з Instagram
+        api_url = "https://snapsave.app/action.php"
+        payload = {"url": url}
+        headers = {
+            "User-Agent": random.choice(USER_AGENTS),
+            "Referer": "https://snapsave.app/",
+            "Origin": "https://snapsave.app",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if info is None:
-                logger.error(f"{platform}: yt-dlp returned None")
-                return None, "unknown"
+        # curl_cffi з імперсонацією Chrome — виглядає як реальний браузер
+        resp = cffi_requests.post(
+            api_url,
+            data=payload,
+            headers=headers,
+            impersonate="chrome110",  # точний TLS fingerprint Chrome 110
+            timeout=15,
+        )
 
-            logger.info(f"Title: {info.get('title', '?')} | Duration: {info.get('duration', 0)}s")
+        if resp.status_code != 200:
+            logger.info(f"External service returned {resp.status_code}")
+            return None
 
-            filename = ydl.prepare_filename(info)
-            base = Path(filename).stem
+        data = resp.json()
 
-            valid_video_exts = (".mp4", ".mov", ".mkv", ".webm")
-            valid_photo_exts = (".jpg", ".jpeg", ".png", ".webp")
-            all_exts = valid_video_exts + valid_photo_exts
+        # SnapSave повертає масив посилань — беремо перше відео
+        links = data.get("data", [])
+        video_url = None
+        for link in links:
+            if link.get("type") == "mp4" or ".mp4" in link.get("url", ""):
+                video_url = link.get("url")
+                break
 
-            for f in Path(output_dir).iterdir():
-                if f.stem == base and f.suffix.lower() in all_exts:
-                    media_type = "photo" if f.suffix.lower() in valid_photo_exts else "video"
-                    logger.info(f"Found [{media_type}]: {f.name} ({f.stat().st_size / 1024 / 1024:.2f} MB)")
-                    return str(f), media_type
+        if not video_url:
+            logger.info("External service: no video URL in response")
+            return None
 
-            # Fallback: перший медіа файл
-            for f in Path(output_dir).iterdir():
-                if f.suffix.lower() in all_exts:
-                    media_type = "photo" if f.suffix.lower() in valid_photo_exts else "video"
-                    logger.info(f"Fallback [{media_type}]: {f.name}")
-                    return str(f), media_type
-
-            logger.error("No media file found in output directory")
-            return None, "unknown"
-
-    except yt_dlp.utils.DownloadError as e:
-        # Фото пости і каруселі не підтримуються
-        if "There is no video in this post" in str(e):
-            logger.info("Photo/album post — not supported")
-            return None, "photo_not_supported"
-
-        logger.error(f"DownloadError [{platform}]: {e}")
-        return None, "unknown"
+        # Завантажуємо відео за прямим посиланням
+        return _download_direct_url(video_url, output_dir, use_proxy=False)
 
     except Exception as e:
-        logger.error(f"Unexpected error [{platform}]: {e}", exc_info=True)
-        return None, "unknown"
-
+        logger.info(f"External service failed: {e}")
+        return None
 
 
 # ──────────────────────────────────────────
-# TYPING INDICATOR
+# МЕТОД 2: curl_cffi з cookies акаунту
+# Для приватного контенту, сторіз, 18+
+# Instagram бачить "Chrome браузер" з авторизованою сесією
+# ──────────────────────────────────────────
+def _try_instagram_api(url: str, output_dir: str, content_type: str) -> str | None:
+    """
+    Завантаження через Instagram Graph API / приватний API
+    з використанням cookies авторизованого акаунту.
+
+    Принцип: надсилаємо запит точно так, як це робить мобільний Chrome,
+    включно з TLS fingerprint (це і є головна перевага curl_cffi над yt-dlp).
+    """
+    if not _INSTAGRAM_COOKIES:
+        logger.warning("No cookies — skipping authenticated request")
+        return None
+
+    try:
+        # Налаштування проксі (residential IP якщо є)
+        proxies = {}
+        if RESIDENTIAL_PROXY:
+            proxies = {"https": RESIDENTIAL_PROXY, "http": RESIDENTIAL_PROXY}
+            logger.info("Using residential proxy")
+
+        session = cffi_requests.Session()
+        session.cookies.update(_INSTAGRAM_COOKIES)
+
+        # Визначаємо shortcode або media_id з URL
+        if content_type == "story":
+            match = INSTAGRAM_STORY_PATTERN.search(url)
+            if not match:
+                return None
+            username, media_id = match.group(1), match.group(2)
+            return _download_story(session, username, media_id, output_dir, proxies)
+        else:
+            match = INSTAGRAM_POST_PATTERN.search(url)
+            if not match:
+                return None
+            shortcode = match.group(1)
+            return _download_post(session, shortcode, output_dir, proxies)
+
+    except Exception as e:
+        logger.error(f"Instagram API error: {e}", exc_info=True)
+        return None
+
+
+def _download_post(session, shortcode: str, output_dir: str, proxies: dict) -> str | None:
+    """
+    Отримуємо медіа-інфо через Instagram GraphQL API.
+    Це той самий endpoint що використовує веб-версія Instagram.
+    """
+    # GraphQL запит — офіційний внутрішній API Instagram
+    api_url = f"https://www.instagram.com/api/v1/media/{shortcode}/info/"
+
+    # Альтернативний endpoint через oEmbed (публічний, не потребує авторизації для публічного)
+    oembed_url = f"https://www.instagram.com/p/{shortcode}/?__a=1&__d=dis"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "X-IG-App-ID": "936619743392459",  # офіційний App ID веб-версії Instagram
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": f"https://www.instagram.com/p/{shortcode}/",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+    }
+
+    resp = session.get(
+        oembed_url,
+        headers=headers,
+        impersonate="chrome110",
+        proxies=proxies or None,
+        timeout=20,
+    )
+
+    if resp.status_code != 200:
+        logger.warning(f"Post API returned {resp.status_code} for {shortcode}")
+        return None
+
+    try:
+        data = resp.json()
+    except Exception:
+        logger.warning("Post API: invalid JSON response")
+        return None
+
+    # Знаходимо URL відео в структурі відповіді
+    items = data.get("items", [data.get("graphql", {}).get("shortcode_media", {})])
+    for item in items:
+        video_url = item.get("video_url")
+        if video_url:
+            logger.info(f"Found video URL for post {shortcode}")
+            return _download_direct_url(video_url, output_dir, use_proxy=bool(proxies), proxies=proxies)
+
+    logger.info(f"No video URL found for post {shortcode} (може бути фото)")
+    return None
+
+
+def _download_story(session, username: str, media_id: str, output_dir: str, proxies: dict) -> str | None:
+    """
+    Завантажує сторіз через Instagram Stories API.
+    Сторіз доступні тільки для підписників приватних акаунтів
+    або публічно — для публічних профілів.
+    """
+    # Спочатку отримуємо user_id за username
+    user_info_url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "X-IG-App-ID": "936619743392459",
+        "Referer": f"https://www.instagram.com/{username}/",
+    }
+
+    resp = session.get(
+        user_info_url,
+        headers=headers,
+        impersonate="chrome110",
+        proxies=proxies or None,
+        timeout=15,
+    )
+
+    if resp.status_code != 200:
+        logger.warning(f"Could not get user info for {username}: {resp.status_code}")
+        return None
+
+    try:
+        user_data = resp.json()
+        user_id = user_data["data"]["user"]["id"]
+    except (KeyError, json.JSONDecodeError):
+        logger.warning(f"Could not parse user_id for {username}")
+        return None
+
+    # Тепер отримуємо сторіз цього користувача
+    stories_url = f"https://www.instagram.com/api/v1/feed/reels_media/?reel_ids={user_id}"
+    resp = session.get(
+        stories_url,
+        headers=headers,
+        impersonate="chrome110",
+        proxies=proxies or None,
+        timeout=15,
+    )
+
+    if resp.status_code != 200:
+        logger.warning(f"Stories API returned {resp.status_code}")
+        return None
+
+    try:
+        stories_data = resp.json()
+        reels = stories_data.get("reels", {})
+        reel = reels.get(user_id, reels.get(str(user_id), {}))
+        items = reel.get("items", [])
+
+        # Знаходимо конкретну сторіз за media_id
+        for item in items:
+            if str(item.get("pk", "")) == media_id or str(item.get("id", "")).startswith(media_id):
+                if item.get("media_type") == 2:  # 2 = відео в Instagram API
+                    # Беремо відео найкращої якості
+                    video_versions = item.get("video_versions", [])
+                    if video_versions:
+                        video_url = video_versions[0]["url"]
+                        logger.info(f"Found story video for {username}/{media_id}")
+                        return _download_direct_url(video_url, output_dir, use_proxy=bool(proxies), proxies=proxies)
+                else:
+                    logger.info(f"Story {media_id} is a photo, not video")
+                    return None
+
+        logger.warning(f"Story {media_id} not found in feed (можливо вже видалено або закінчився термін)")
+        return None
+
+    except Exception as e:
+        logger.error(f"Story parsing error: {e}", exc_info=True)
+        return None
+
+
+# ──────────────────────────────────────────
+# МЕТОД 3: Facebook через yt-dlp (залишаємо як є, там він добре працює)
+# ──────────────────────────────────────────
+def _download_facebook(url: str, output_dir: str) -> str | None:
+    """Facebook завантаження через yt-dlp — там він справляється добре."""
+    try:
+        import yt_dlp
+
+        output_template = os.path.join(output_dir, "%(id)s.%(ext)s")
+        user_agent = random.choice(USER_AGENTS)
+        ydl_opts = {
+            "outtmpl": output_template,
+            "quiet": False,
+            "format": "best[ext=mp4][height<=1080]/best[ext=mp4]/best",
+            "merge_output_format": "mp4",
+            "max_filesize": 50 * 1024 * 1024,
+            "http_headers": {
+                "User-Agent": user_agent,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+            },
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if not info:
+                return None
+            for f in Path(output_dir).iterdir():
+                if f.suffix.lower() in (".mp4", ".mov", ".webm", ".mkv"):
+                    return str(f)
+        return None
+    except Exception as e:
+        logger.error(f"Facebook download error: {e}")
+        return None
+
+
+# ──────────────────────────────────────────
+# ДОПОМІЖНА: завантажити файл за прямим URL
+# ──────────────────────────────────────────
+def _download_direct_url(
+    video_url: str,
+    output_dir: str,
+    use_proxy: bool = False,
+    proxies: dict | None = None,
+    chunk_size: int = 1024 * 1024,  # 1MB chunks
+) -> str | None:
+    """
+    Завантажує файл за прямим CDN-посиланням.
+    Стримінгове завантаження по шматках — не навантажує RAM.
+    """
+    try:
+        output_path = os.path.join(output_dir, "video.mp4")
+        resp = cffi_requests.get(
+            video_url,
+            impersonate="chrome110",
+            proxies=proxies if use_proxy and proxies else None,
+            timeout=60,
+            stream=True,  # стримінг — не чекаємо поки весь файл буферизується
+        )
+
+        if resp.status_code != 200:
+            logger.warning(f"Direct download returned {resp.status_code}")
+            return None
+
+        total_size = 0
+        max_size = 50 * 1024 * 1024  # 50MB ліміт Telegram
+
+        with open(output_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    total_size += len(chunk)
+                    if total_size > max_size:
+                        logger.warning("File exceeds 50MB limit, aborting")
+                        return None
+                    f.write(chunk)
+
+        logger.info(f"Downloaded {total_size / 1024 / 1024:.2f} MB to {output_path}")
+        return output_path
+
+    except Exception as e:
+        logger.error(f"Direct download error: {e}")
+        return None
+
+
+# ──────────────────────────────────────────
+# ГОЛОВНА ФУНКЦІЯ — КАСКАД МЕТОДІВ
+# ──────────────────────────────────────────
+def download_media(url: str, output_dir: str, platform: str, content_type: str) -> tuple[str | None, str]:
+    """
+    Каскадний підхід:
+      1. Зовнішній сервіс (швидко, публічний контент, не навантажує акаунт)
+      2. curl_cffi + cookies (приватне, сторіз, 18+, з residential proxy якщо є)
+      3. yt-dlp (тільки для Facebook)
+
+    Повертає (filepath, media_type_string).
+    """
+    if platform == "facebook":
+        path = _download_facebook(url, output_dir)
+        return (path, "video") if path else (None, "unknown")
+
+    # Instagram — спочатку пробуємо зовнішній сервіс
+    # Він не потребує наших cookies і не ризикує акаунтом
+    logger.info(f"[Instagram] Step 1: Trying external service | type={content_type}")
+    time.sleep(random.uniform(0.3, 1.0))  # пауза щоб не виглядати як бот
+
+    # Сторіз не мають публічного доступу через зовнішні сервіси — одразу переходимо до крок 2
+    if content_type != "story":
+        path = _try_external_service(url, output_dir)
+        if path and Path(path).exists():
+            logger.info("[Instagram] External service succeeded ✓")
+            return path, "video"
+        logger.info("[Instagram] External service failed — trying authenticated request")
+
+    # Крок 2: curl_cffi з нашими cookies
+    logger.info(f"[Instagram] Step 2: Authenticated curl_cffi | cookies={'yes' if _INSTAGRAM_COOKIES else 'no'}")
+    path = _try_instagram_api(url, output_dir, content_type)
+    if path and Path(path).exists():
+        logger.info("[Instagram] Authenticated request succeeded ✓")
+        return path, "video"
+
+    logger.warning("[Instagram] All methods failed")
+    return None, "unknown"
+
+
+# ──────────────────────────────────────────
+# TYPING INDICATOR (без змін)
 # ──────────────────────────────────────────
 async def keep_uploading_action(chat_id: int, bot, media_type: str = "video") -> None:
     action = "upload_photo" if media_type == "photo" else "upload_video"
@@ -211,32 +501,27 @@ async def keep_uploading_action(chat_id: int, bot, media_type: str = "video") ->
 
 
 # ──────────────────────────────────────────
-# RATE LIMIT
+# RATE LIMIT (без змін)
 # ──────────────────────────────────────────
 def check_rate_limit(user_id: int) -> tuple[bool, int]:
     now = time.time()
-
     cooldown = user_cooldowns.get(user_id, 0)
     if now < cooldown:
         return False, int((cooldown - now) / 60)
-
     if user_id not in user_timestamps:
         user_timestamps[user_id] = deque()
-
     timestamps = user_timestamps[user_id]
     while timestamps and timestamps[0] < now - REQUEST_WINDOW:
         timestamps.popleft()
-
     if len(timestamps) >= REQUEST_LIMIT:
         user_cooldowns[user_id] = now + COOLDOWN_TIME
         return False, COOLDOWN_TIME // 60
-
     timestamps.append(now)
     return True, 0
 
 
 # ──────────────────────────────────────────
-# HANDLER
+# HANDLER — оновлено для нового extract_url
 # ──────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
@@ -249,7 +534,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     user_id = message.from_user.id
     allowed, cooldown_mins = check_rate_limit(user_id)
-
     if not allowed:
         err = await message.reply_text(
             f"Забагато запитів. Спробуй через {cooldown_mins} хв.",
@@ -262,8 +546,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             pass
         return
 
-    media_url, platform = url_info
-    logger.info(f"Processing {platform.upper()} | user_id={user_id} | {media_url}")
+    media_url, platform, content_type = url_info
+    logger.info(f"Processing {platform.upper()} [{content_type}] | user_id={user_id} | {media_url}")
 
     typing_task = asyncio.create_task(
         keep_uploading_action(message.chat_id, context.bot, "video")
@@ -271,20 +555,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         with tempfile.TemporaryDirectory() as tmp_dir:
+            # Запускаємо синхронний download в окремому потоці
+            # щоб не блокувати async event loop Telegram
             media_path, media_type = await asyncio.get_event_loop().run_in_executor(
-                None, download_media, media_url, tmp_dir, platform
+                None, download_media, media_url, tmp_dir, platform, content_type
             )
 
-            # Не вдалось завантажити
             if not media_path or not Path(media_path).exists():
-                logger.warning(f"Download failed [{platform}]: {media_url}")
-
-                if media_type == "photo_not_supported":
-                    text = "Фото пости та каруселі не підтримуються.\nНадішли посилання на Reels або відео."
-                else:
-                    text = f"Не вдалося завантажити з {platform.title()}.\nМожливо, контент приватний або недоступний."
-
-                err = await message.reply_text(text, reply_to_message_id=message.message_id)
+                logger.warning(f"Download failed [{platform}/{content_type}]: {media_url}")
+                err = await message.reply_text(
+                    "Не вдалося завантажити.\n"
+                    "Можливі причини: приватний акаунт без підписки бота, "
+                    "сторіз вже видалено або контент недоступний.",
+                    reply_to_message_id=message.message_id
+                )
                 await asyncio.sleep(10)
                 try:
                     await err.delete()
@@ -292,7 +576,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     pass
                 return
 
-            # Файл завеликий
             if Path(media_path).stat().st_size > 50 * 1024 * 1024:
                 err = await message.reply_text(
                     "Файл завеликий для відправки (понад 50 МБ).",
@@ -305,25 +588,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     pass
                 return
 
-            # Оновлюємо typing під реальний тип
             typing_task.cancel()
             typing_task = asyncio.create_task(
                 keep_uploading_action(message.chat_id, context.bot, media_type)
             )
 
-            # Відправка
             try:
                 with open(media_path, "rb") as f:
-                    if media_type == "photo":
-                        await context.bot.send_photo(chat_id=message.chat_id, photo=f)
-                        logger.info(f"Sent photo: {Path(media_path).name}")
-                    else:
-                        await context.bot.send_video(
-                            chat_id=message.chat_id,
-                            video=f,
-                            supports_streaming=True
-                        )
-                        logger.info(f"Sent video: {Path(media_path).name}")
+                    await context.bot.send_video(
+                        chat_id=message.chat_id,
+                        video=f,
+                        supports_streaming=True
+                    )
+                    logger.info(f"Sent video: {Path(media_path).name}")
 
                 try:
                     await message.delete()
@@ -346,20 +623,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # ──────────────────────────────────────────
-# APP FACTORY
+# APP FACTORY (без змін)
 # ──────────────────────────────────────────
 def create_application() -> Application:
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN environment variable is not set!")
-
     _init_cookies()
-
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
-
-    logger.info("Bot started | Platforms: Instagram (Reels/video), Facebook")
-    logger.info(f"Instagram cookies: {_INSTAGRAM_COOKIES_FILE is not None}")
-
+    logger.info("Bot started | Platforms: Instagram (posts/reels/stories), Facebook")
+    logger.info(f"Instagram cookies: {'loaded' if _INSTAGRAM_COOKIES else 'NOT SET'}")
+    logger.info(f"Residential proxy: {'configured' if RESIDENTIAL_PROXY else 'not set (datacenter IP)'}")
     return app

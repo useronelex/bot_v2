@@ -325,18 +325,29 @@ def _download_post_ogvideo(session, shortcode: str, output_dir: str, proxies: di
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Site": "none",
         }
-        resp = session.get(
-            page_url,
-            headers=headers,
-            impersonate="chrome120",
-            proxies=proxies or None,
-            timeout=20,
-            allow_redirects=False,  # вимикаємо авто-редіректи — обробляємо вручну
-        )
+        # Спочатку пробуємо БЕЗ проксі — сесія Instagram прив'язана до IP де авторизувались.
+        # Проксі змінює IP → Instagram бачить "інший пристрій" і відхиляє cookies.
+        # Прямий IP Render.com для HTML-сторінки менш підозрілий ніж для API.
+        for use_proxy_attempt in [False, True]:
+            _proxies = (proxies or None) if use_proxy_attempt else None
+            resp = session.get(
+                page_url,
+                headers=headers,
+                impersonate="chrome120",
+                proxies=_proxies,
+                timeout=20,
+                allow_redirects=False,
+            )
+            if resp.status_code not in (301, 302, 303, 307, 308):
+                break  # отримали реальну відповідь — виходимо з циклу спроб
+            logger.info(f"og:video: redirect (proxy={'yes' if use_proxy_attempt else 'no'}) for {shortcode}")
+        else:
+            # Обидві спроби дали редірект
+            logger.info(f"og:video: both attempts redirected for {shortcode} — cookies rejected")
+            return None
 
         # Якщо Instagram перенаправляє на логін — cookies не прийняті або застаріли
         if resp.status_code in (301, 302, 303, 307, 308):
-            location = resp.headers.get("location", "")
             logger.info(f"og:video: redirect to login for {shortcode} — cookies rejected")
             return None
 
@@ -386,6 +397,19 @@ def _download_post_graphql(session, shortcode: str, output_dir: str, proxies: di
             "10015901848480474",  # 2025 Q1
             "9496696450386181",   # альтернативний
         ]
+
+        # headers визначаємо ДО циклу — щоб були доступні всередині
+        headers = {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "X-IG-App-ID": "936619743392459",
+            "X-CSRFToken": session.cookies.get("csrftoken", ""),
+            "Referer": f"https://www.instagram.com/p/{shortcode}/",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        }
 
         data = None
         for doc_id in GRAPHQL_DOC_IDS:

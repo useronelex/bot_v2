@@ -328,16 +328,28 @@ def _download_post_ogvideo(session, shortcode: str, output_dir: str, proxies: di
         resp = session.get(
             page_url,
             headers=headers,
-            impersonate="chrome120",  # найновіший fingerprint
+            impersonate="chrome120",
             proxies=proxies or None,
             timeout=20,
+            allow_redirects=False,  # вимикаємо авто-редіректи — обробляємо вручну
         )
+
+        # Якщо Instagram перенаправляє на логін — cookies не прийняті або застаріли
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location = resp.headers.get("location", "")
+            logger.info(f"og:video: redirect to login for {shortcode} — cookies rejected")
+            return None
 
         if resp.status_code != 200:
             logger.info(f"og:video page returned {resp.status_code} for {shortcode}")
             return None
 
         html = resp.text
+
+        # Якщо потрапили на сторінку логіну (Instagram іноді повертає 200 але з login-формою)
+        if "login" in html[:2000].lower() and "og:video" not in html[:5000]:
+            logger.info(f"og:video: got login page for {shortcode}")
+            return None
 
         # Шукаємо og:video — це пряме CDN посилання на відео
         # Instagram вставляє його для всіх відео-постів і рілсів
@@ -367,37 +379,47 @@ def _download_post_graphql(session, shortcode: str, output_dir: str, proxies: di
     """
     try:
         graphql_url = "https://www.instagram.com/graphql/query/"
-        params = {
-            "doc_id": "8845758582119845",
-            "variables": json.dumps({"shortcode": shortcode, "fetch_tagged_user_count": None}),
-        }
-        headers = {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "X-IG-App-ID": "936619743392459",
-            "X-CSRFToken": session.cookies.get("csrftoken", ""),
-            "Referer": f"https://www.instagram.com/p/{shortcode}/",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-        }
-        resp = session.get(
-            graphql_url,
-            params=params,
-            headers=headers,
-            impersonate="chrome110",
-            proxies=proxies or None,
-            timeout=20,
-        )
-        if resp.status_code != 200:
-            logger.info(f"GraphQL returned {resp.status_code} for {shortcode}")
+        # Instagram змінює doc_id з кожним оновленням — пробуємо кілька актуальних
+        # Якщо один не повертає даних (media is None) — пробуємо наступний
+        GRAPHQL_DOC_IDS = [
+            "8845758582119845",   # 2024 Q4
+            "10015901848480474",  # 2025 Q1
+            "9496696450386181",   # альтернативний
+        ]
+
+        data = None
+        for doc_id in GRAPHQL_DOC_IDS:
+            try:
+                params = {
+                    "doc_id": doc_id,
+                    "variables": json.dumps({"shortcode": shortcode, "fetch_tagged_user_count": None}),
+                }
+                _r = session.get(
+                    graphql_url,
+                    params=params,
+                    headers=headers,
+                    impersonate="chrome110",
+                    proxies=proxies or None,
+                    timeout=20,
+                )
+                if _r.status_code == 200:
+                    _d = _r.json()
+                    if _d.get("data", {}).get("xdt_shortcode_media") is not None:
+                        data = _d
+                        logger.info(f"GraphQL: doc_id {doc_id} worked for {shortcode}")
+                        break
+                    else:
+                        logger.info(f"GraphQL: doc_id {doc_id} returned None for {shortcode}")
+            except Exception as _e:
+                logger.info(f"GraphQL: doc_id {doc_id} failed: {_e}")
+
+        # Якщо жоден doc_id не дав результату — виходимо
+        if data is None:
+            logger.info(f"GraphQL: all doc_ids failed for {shortcode}")
             return None
 
-        data = resp.json()
         media = data.get("data", {}).get("xdt_shortcode_media")
         if media is None:
-            logger.info(f"GraphQL: media is None for {shortcode} (doc_id можливо застарів)")
             return None
 
         video_url = media.get("video_url")

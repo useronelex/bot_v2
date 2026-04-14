@@ -194,38 +194,41 @@ def _try_igram(url: str, output_dir: str) -> str | None:
 
 
 def _try_instafinsta(url: str, output_dir: str) -> str | None:
-    """instafinsta.com як резервний варіант."""
+    """saveig.app як резервний варіант після igram."""
     try:
-        api_url = "https://instafinsta.com/wp-json/aio-dl/video-data/"
+        api_url = "https://saveig.app/api/ajaxSearch"
         headers = {
             "User-Agent": random.choice(USER_AGENTS),
-            "Referer": "https://instafinsta.com/",
+            "Referer": "https://saveig.app/",
+            "Origin": "https://saveig.app",
             "Content-Type": "application/x-www-form-urlencoded",
+            "X-Requested-With": "XMLHttpRequest",
         }
         resp = cffi_requests.post(
             api_url,
-            data={"url": url, "token": ""},
+            data={"q": url, "t": "media", "lang": "en"},
             headers=headers,
             impersonate="chrome110",
             timeout=15,
         )
         if resp.status_code != 200:
-            logger.info(f"instafinsta returned {resp.status_code}")
+            logger.info(f"saveig returned {resp.status_code}")
             return None
 
         data = resp.json()
-        medias = data.get("medias", [])
-        for media in medias:
-            if media.get("extension") == "mp4":
-                video_url = media.get("url")
-                if video_url:
-                    logger.info("instafinsta succeeded")
-                    return _download_direct_url(video_url, output_dir, use_proxy=False)
+        # saveig повертає HTML всередині JSON поля "data" — парсимо посилання
+        html = data.get("data", "")
+        # Шукаємо пряме посилання на mp4
+        import re as _re
+        matches = _re.findall(r'href=["\']([^"\']+\.mp4[^"\']*)["\']', html)
+        if matches:
+            logger.info("saveig succeeded")
+            return _download_direct_url(matches[0], output_dir, use_proxy=False)
 
-        logger.info("instafinsta: no video in response")
+        logger.info("saveig: no video link in response")
         return None
     except Exception as e:
-        logger.info(f"instafinsta failed: {e}")
+        logger.info(f"saveig failed: {e}")
         return None
 
 
@@ -328,8 +331,13 @@ def _download_post(session, shortcode: str, output_dir: str, proxies: dict) -> s
         return _download_post_fallback(session, shortcode, output_dir, proxies)
 
     # Навігація по структурі GraphQL відповіді
+    # media може бути None якщо Instagram повернув відповідь без даних
+    # (геоблок, вікове обмеження, або контент видалено)
     try:
-        media = data["data"]["xdt_shortcode_media"]
+        media = data.get("data", {}).get("xdt_shortcode_media")
+        if media is None:
+            logger.info(f"GraphQL: media is None for {shortcode} — falling back")
+            return _download_post_fallback(session, shortcode, output_dir, proxies)
         video_url = media.get("video_url")
         if video_url:
             logger.info(f"GraphQL: found video for {shortcode}")

@@ -280,70 +280,132 @@ def _try_instagram_api(url: str, output_dir: str, content_type: str) -> str | No
 
 def _download_post(session, shortcode: str, output_dir: str, proxies: dict) -> str | None:
     """
-    Отримуємо медіа через Instagram GraphQL API.
+    Завантажує пост/reel через каскад трьох методів:
 
-    Чому GraphQL, а не ?__a=1?
-    Endpoint __a=1 Instagram відключив ще у 2022 — він повертає 404 майже завжди.
-    GraphQL endpoint /graphql/query/ — це те що реально використовує веб-версія
-    Instagram при відкритті поста. Він потребує правильного X-IG-App-ID і cookies.
+    1. og:video з HTML сторінки — найстабільніший метод.
+       Instagram вбудовує пряме CDN-посилання на відео прямо в HTML
+       у мета-тезі <meta property="og:video">, саме цим користується
+       Telegram коли показує прев'ю посилань. З cookies це працює і для 18+.
+
+    2. GraphQL /graphql/query/ — швидший але нестабільний:
+       doc_id змінюється з кожним оновленням Instagram.
+
+    3. Мобільний API /api/v1/media/shortcode/info/ — як останній резерв.
     """
-    # Це офіційний GraphQL запит який відправляє браузер при відкритті поста
-    graphql_url = "https://www.instagram.com/graphql/query/"
+    # ── Метод 1: og:video з HTML ─────────────────────────────────────────────
+    result = _download_post_ogvideo(session, shortcode, output_dir, proxies)
+    if result:
+        return result
 
-    # doc_id — це внутрішній ID GraphQL запиту Instagram для отримання медіа поста
-    # Значення стабільне і не змінюється часто
-    params = {
-        "doc_id": "8845758582119845",
-        "variables": json.dumps({"shortcode": shortcode, "fetch_tagged_user_count": None}),
-    }
+    # ── Метод 2: GraphQL (якщо og:video не спрацював) ───────────────────────
+    result = _download_post_graphql(session, shortcode, output_dir, proxies)
+    if result:
+        return result
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "X-IG-App-ID": "936619743392459",
-        "X-FB-Friendly-Name": "PolarisPostActionLoadPostQueryQuery",
-        "X-CSRFToken": session.cookies.get("csrftoken", ""),
-        "Referer": f"https://www.instagram.com/p/{shortcode}/",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
-    }
+    # ── Метод 3: Мобільний API ───────────────────────────────────────────────
+    return _download_post_mobile_api(session, shortcode, output_dir, proxies)
 
-    resp = session.get(
-        graphql_url,
-        params=params,
-        headers=headers,
-        impersonate="chrome110",
-        proxies=proxies or None,
-        timeout=20,
-    )
 
-    if resp.status_code != 200:
-        logger.warning(f"GraphQL returned {resp.status_code} for {shortcode}")
-        # Спробуємо запасний endpoint — прямий API медіа
-        return _download_post_fallback(session, shortcode, output_dir, proxies)
+def _download_post_ogvideo(session, shortcode: str, output_dir: str, proxies: dict) -> str | None:
+    """
+    Метод 1: завантажуємо HTML сторінку поста і витягуємо og:video URL.
 
+    Це той самий підхід що використовує Telegram для прев'ю посилань —
+    дуже стабільний бо Instagram не може його "зламати" не зламавши
+    при цьому всі месенджери і соціальні мережі одночасно.
+    """
     try:
+        page_url = f"https://www.instagram.com/p/{shortcode}/"
+        headers = {
+            # Використовуємо десктопний Chrome — він отримує повний HTML з мета-тегами
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+        }
+        resp = session.get(
+            page_url,
+            headers=headers,
+            impersonate="chrome120",  # найновіший fingerprint
+            proxies=proxies or None,
+            timeout=20,
+        )
+
+        if resp.status_code != 200:
+            logger.info(f"og:video page returned {resp.status_code} for {shortcode}")
+            return None
+
+        html = resp.text
+
+        # Шукаємо og:video — це пряме CDN посилання на відео
+        # Instagram вставляє його для всіх відео-постів і рілсів
+        match = re.search(r'<meta property="og:video" content="([^"]+)"', html)
+        if not match:
+            # Альтернативний формат мета-тегу
+            match = re.search(r'<meta content="([^"]+)" property="og:video"', html)
+
+        if match:
+            video_url = match.group(1).replace("&amp;", "&")
+            logger.info(f"og:video: found video URL for {shortcode}")
+            return _download_direct_url(video_url, output_dir, use_proxy=bool(proxies), proxies=proxies)
+
+        # og:video не знайдено — можливо це фото пост або Instagram не вставив мета-тег
+        logger.info(f"og:video: no video meta tag for {shortcode}")
+        return None
+
+    except Exception as e:
+        logger.info(f"og:video failed for {shortcode}: {e}")
+        return None
+
+
+def _download_post_graphql(session, shortcode: str, output_dir: str, proxies: dict) -> str | None:
+    """
+    Метод 2: GraphQL API.
+    doc_id може застаріти — тому це вже не основний а резервний метод.
+    """
+    try:
+        graphql_url = "https://www.instagram.com/graphql/query/"
+        params = {
+            "doc_id": "8845758582119845",
+            "variables": json.dumps({"shortcode": shortcode, "fetch_tagged_user_count": None}),
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "X-IG-App-ID": "936619743392459",
+            "X-CSRFToken": session.cookies.get("csrftoken", ""),
+            "Referer": f"https://www.instagram.com/p/{shortcode}/",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        }
+        resp = session.get(
+            graphql_url,
+            params=params,
+            headers=headers,
+            impersonate="chrome110",
+            proxies=proxies or None,
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            logger.info(f"GraphQL returned {resp.status_code} for {shortcode}")
+            return None
+
         data = resp.json()
-    except Exception:
-        logger.warning("GraphQL: invalid JSON response")
-        return _download_post_fallback(session, shortcode, output_dir, proxies)
-
-    # Навігація по структурі GraphQL відповіді
-    # media може бути None якщо Instagram повернув відповідь без даних
-    # (геоблок, вікове обмеження, або контент видалено)
-    try:
         media = data.get("data", {}).get("xdt_shortcode_media")
         if media is None:
-            logger.info(f"GraphQL: media is None for {shortcode} — falling back")
-            return _download_post_fallback(session, shortcode, output_dir, proxies)
+            logger.info(f"GraphQL: media is None for {shortcode} (doc_id можливо застарів)")
+            return None
+
         video_url = media.get("video_url")
         if video_url:
             logger.info(f"GraphQL: found video for {shortcode}")
             return _download_direct_url(video_url, output_dir, use_proxy=bool(proxies), proxies=proxies)
 
-        # Може бути карусель (кілька медіа в одному пості)
+        # Карусель
         edges = media.get("edge_sidecar_to_children", {}).get("edges", [])
         for edge in edges:
             node = edge.get("node", {})
@@ -351,24 +413,20 @@ def _download_post(session, shortcode: str, output_dir: str, proxies: dict) -> s
                 logger.info(f"GraphQL: found carousel video for {shortcode}")
                 return _download_direct_url(node["video_url"], output_dir, use_proxy=bool(proxies), proxies=proxies)
 
-    except (KeyError, TypeError):
-        pass
-
-    logger.info(f"GraphQL: no video for {shortcode} — можливо це фото")
+    except Exception as e:
+        logger.info(f"GraphQL failed: {e}")
     return None
 
 
-def _download_post_fallback(session, shortcode: str, output_dir: str, proxies: dict) -> str | None:
+def _download_post_mobile_api(session, shortcode: str, output_dir: str, proxies: dict) -> str | None:
     """
-    Запасний метод: прямий API endpoint Instagram.
-    Використовується якщо GraphQL не відповів.
+    Метод 3: мобільний API endpoint як останній резерв.
     """
     try:
-        # Цей endpoint використовує мобільний додаток Instagram
         url = f"https://www.instagram.com/api/v1/media/{shortcode}/info/"
         headers = {
-            "User-Agent": "Instagram 275.0.0.27.98 Android",  # мобільний UA
-            "X-IG-App-ID": "567067343352427",  # App ID мобільного додатку
+            "User-Agent": "Instagram 275.0.0.27.98 Android",
+            "X-IG-App-ID": "567067343352427",
         }
         resp = session.get(
             url,
@@ -378,20 +436,18 @@ def _download_post_fallback(session, shortcode: str, output_dir: str, proxies: d
             timeout=15,
         )
         if resp.status_code != 200:
-            logger.warning(f"Post fallback API returned {resp.status_code}")
+            logger.warning(f"Mobile API returned {resp.status_code} for {shortcode}")
             return None
 
         data = resp.json()
-        items = data.get("items", [])
-        for item in items:
-            # Відео версії відсортовані від найкращої якості
+        for item in data.get("items", []):
             video_versions = item.get("video_versions", [])
             if video_versions:
                 video_url = video_versions[0]["url"]
-                logger.info(f"Post fallback: found video for {shortcode}")
+                logger.info(f"Mobile API: found video for {shortcode}")
                 return _download_direct_url(video_url, output_dir, use_proxy=bool(proxies), proxies=proxies)
     except Exception as e:
-        logger.warning(f"Post fallback failed: {e}")
+        logger.warning(f"Mobile API failed: {e}")
     return None
 
 

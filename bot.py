@@ -325,30 +325,19 @@ def _download_post_ogvideo(session, shortcode: str, output_dir: str, proxies: di
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Site": "none",
         }
-        # Спочатку пробуємо БЕЗ проксі — сесія Instagram прив'язана до IP де авторизувались.
-        # Проксі змінює IP → Instagram бачить "інший пристрій" і відхиляє cookies.
-        # Прямий IP Render.com для HTML-сторінки менш підозрілий ніж для API.
-        for use_proxy_attempt in [False, True]:
-            _proxies = (proxies or None) if use_proxy_attempt else None
-            resp = session.get(
-                page_url,
-                headers=headers,
-                impersonate="chrome120",
-                proxies=_proxies,
-                timeout=20,
-                allow_redirects=False,
-            )
-            if resp.status_code not in (301, 302, 303, 307, 308):
-                break  # отримали реальну відповідь — виходимо з циклу спроб
-            logger.info(f"og:video: redirect (proxy={'yes' if use_proxy_attempt else 'no'}) for {shortcode}")
-        else:
-            # Обидві спроби дали редірект
-            logger.info(f"og:video: both attempts redirected for {shortcode} — cookies rejected")
-            return None
+        # Всі запити йдуть через той самий проксі що і авторизація —
+        # Instagram бачить стабільний IP і не підозрює підміну сесії
+        resp = session.get(
+            page_url,
+            headers=headers,
+            impersonate="chrome120",
+            proxies=proxies or None,
+            timeout=20,
+            allow_redirects=False,
+        )
 
-        # Якщо Instagram перенаправляє на логін — cookies не прийняті або застаріли
         if resp.status_code in (301, 302, 303, 307, 308):
-            logger.info(f"og:video: redirect to login for {shortcode} — cookies rejected")
+            logger.info(f"og:video: redirect for {shortcode} — оновіть cookies через login_via_proxy.py")
             return None
 
         if resp.status_code != 200:
@@ -806,22 +795,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 keep_uploading_action(message.chat_id, context.bot, media_type)
             )
 
-            try:
-                with open(media_path, "rb") as f:
-                    await context.bot.send_video(
-                        chat_id=message.chat_id,
-                        video=f,
-                        supports_streaming=True
-                    )
-                    logger.info(f"Sent video: {Path(media_path).name}")
+            # Відправка з retry — великі файли потребують більше часу
+            sent = False
+            last_error = None
+            for attempt in range(3):
+                try:
+                    with open(media_path, "rb") as f:
+                        await context.bot.send_video(
+                            chat_id=message.chat_id,
+                            video=f,
+                            supports_streaming=True,
+                            write_timeout=120,
+                            read_timeout=60,
+                            connect_timeout=30,
+                        )
+                    logger.info(f"Sent video: {Path(media_path).name} (attempt {attempt + 1})")
+                    sent = True
+                    break
+                except Exception as e:
+                    last_error = e
+                    logger.warning(f"Send attempt {attempt + 1} failed: {e}")
+                    if attempt < 2:
+                        await asyncio.sleep(3)
 
+            if sent:
                 try:
                     await message.delete()
                 except Exception as e:
                     logger.warning(f"Could not delete original message: {e}")
-
-            except Exception as e:
-                logger.error(f"Send failed [{platform}]: {e}")
+            else:
+                logger.error(f"Send failed after 3 attempts [{platform}]: {last_error}")
                 err = await message.reply_text(
                     "Помилка при відправці. Спробуйте пізніше.",
                     reply_to_message_id=message.message_id

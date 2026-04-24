@@ -15,27 +15,39 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ──────────────────────────────────────────
+# RATE LIMIT
+# ──────────────────────────────────────────
 REQUEST_LIMIT  = 50
 REQUEST_WINDOW = 3600
 COOLDOWN_TIME  = 1800
 user_timestamps: dict[int, deque] = {}
 user_cooldowns:  dict[int, float] = {}
 
+# ──────────────────────────────────────────
+# CONFIG
+# ──────────────────────────────────────────
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 INSTAGRAM_COOKIES_RAW = os.environ.get("INSTAGRAM_COOKIES", "")
 _COOKIES_FILE: str | None = None
 
+# ──────────────────────────────────────────
+# URL PATTERNS
+# ──────────────────────────────────────────
 INSTAGRAM_POST_PATTERN = re.compile(
-    r'https?://(?:www\.)?instagram\.com/(?:reels?|p|tv)/([A-Za-z0-9_\-]+)'
+    r'https?://(?:www\.)?instagram\.com/(?:reels?|p|tv)/([A-Za-z0-9_\-]+)(?:/[^\s]*)?'
 )
 INSTAGRAM_STORY_PATTERN = re.compile(
-    r'https?://(?:www\.)?instagram\.com/stories/([A-Za-z0-9_\.]+)/(\d+)'
+    r'https?://(?:www\.)?instagram\.com/stories/([A-Za-z0-9_\.]+)/(\d+)(?:/[^\s]*)?'
 )
 FACEBOOK_URL_PATTERN = re.compile(
     r'https?://(?:www\.|m\.|web\.)?facebook\.com/(?:watch/?\?v=|[\w\-\.]+/videos/|share/[vr]/)[\d\w\-]+'
 )
 
+# ──────────────────────────────────────────
+# COOKIES INIT
+# ──────────────────────────────────────────
 def _init_cookies() -> None:
     global _COOKIES_FILE
     if not INSTAGRAM_COOKIES_RAW:
@@ -46,29 +58,29 @@ def _init_cookies() -> None:
         f.write(INSTAGRAM_COOKIES_RAW)
     _COOKIES_FILE = path
 
-def extract_url(text: str):
-    for pattern, p, t in [
-        (INSTAGRAM_STORY_PATTERN, "instagram", "story"),
-        (INSTAGRAM_POST_PATTERN, "instagram", "post"),
-        (FACEBOOK_URL_PATTERN, "facebook", "facebook")
-    ]:
-        m = pattern.search(text)
-        if m:
-            return (m.group(0), p, t)
+# ──────────────────────────────────────────
+# URL EXTRACTOR
+# ──────────────────────────────────────────
+def extract_url(text: str) -> tuple[str, str, str] | None:
+    match = INSTAGRAM_STORY_PATTERN.search(text)
+    if match:
+        return (match.group(0), "instagram", "story")
+    match = INSTAGRAM_POST_PATTERN.search(text)
+    if match:
+        return (match.group(0), "instagram", "post")
+    match = FACEBOOK_URL_PATTERN.search(text)
+    if match:
+        return (match.group(0), "facebook", "facebook")
     return None
 
 
-# 🔥 ОНОВЛЕНА КОНВЕРТАЦІЯ
+# ──────────────────────────────────────────
+# 🔥 FIX ДЛЯ iPHONE
+# ──────────────────────────────────────────
 def convert_to_ios_compatible(input_path: str) -> str:
     import subprocess
 
-    # ❗ НЕ конвертуємо mp4
-    if input_path.endswith(".mp4"):
-        return input_path
-
-    output_path = str(
-        Path(input_path).with_name(f"converted_{int(time.time()*1000)}.mp4")
-    )
+    output_path = str(Path(input_path).with_name(f"fixed_{int(time.time()*1000)}.mp4"))
 
     cmd = [
         "ffmpeg",
@@ -76,11 +88,18 @@ def convert_to_ios_compatible(input_path: str) -> str:
         "-i", input_path,
 
         "-c:v", "libx264",
-        "-profile:v", "high",
+        "-profile:v", "main",
         "-level", "4.0",
         "-pix_fmt", "yuv420p",
+
+        "-r", "30",
+        "-g", "30",
+        "-keyint_min", "30",
+        "-sc_threshold", "0",
+        "-force_key_frames", "0",
+
         "-preset", "fast",
-        "-crf", "26",
+        "-crf", "23",
 
         "-vf", "scale='min(1280,iw)':-2",
 
@@ -92,23 +111,20 @@ def convert_to_ios_compatible(input_path: str) -> str:
         output_path
     ]
 
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    if result.returncode != 0:
-        logger.error(f"FFmpeg error: {result.stderr.decode()[:300]}")
-        return input_path
-
-    if Path(output_path).exists():
-        return output_path
-
-    return input_path
+    return output_path if Path(output_path).exists() else input_path
 
 
-def _download_instagram(url: str, output_dir: str):
+# ──────────────────────────────────────────
+# INSTAGRAM
+# ──────────────────────────────────────────
+def _download_instagram(url: str, output_dir: str) -> str | None:
     from gallery_dl import config as gdl_config, job as gdl_job
 
     gdl_config.clear()
     gdl_config.set((), "base-directory", output_dir)
+    gdl_config.set((), "directory", [])
     gdl_config.set((), "filename", "video.{extension}")
 
     if _COOKIES_FILE:
@@ -118,7 +134,7 @@ def _download_instagram(url: str, output_dir: str):
         gdl_job.DownloadJob(url).run()
 
         for f in Path(output_dir).rglob("*"):
-            if f.suffix.lower() in (".mp4", ".mov", ".webm", ".mkv"):
+            if f.suffix.lower() in (".mp4", ".mov", ".webm", ".mkv") and f.stat().st_size > 0:
                 return str(f)
         return None
     except Exception as e:
@@ -126,13 +142,16 @@ def _download_instagram(url: str, output_dir: str):
         return None
 
 
-def _download_facebook(url: str, output_dir: str):
+# ──────────────────────────────────────────
+# FACEBOOK
+# ──────────────────────────────────────────
+def _download_facebook(url: str, output_dir: str) -> str | None:
     try:
         import yt_dlp
         with yt_dlp.YoutubeDL({
             "outtmpl": os.path.join(output_dir, "video.%(ext)s"),
             "format": "best[ext=mp4]/best",
-            "quiet": True
+            "quiet": True,
         }) as ydl:
             ydl.download([url])
 
@@ -144,7 +163,10 @@ def _download_facebook(url: str, output_dir: str):
         return None
 
 
-def download_media(url, output_dir, platform):
+# ──────────────────────────────────────────
+# DISPATCH
+# ──────────────────────────────────────────
+def download_media(url: str, output_dir: str, platform: str):
     if platform == "facebook":
         path = _download_facebook(url, output_dir)
     else:
@@ -153,7 +175,10 @@ def download_media(url, output_dir, platform):
     return (path, "video") if path else (None, "unknown")
 
 
-async def keep_uploading_action(chat_id, bot):
+# ──────────────────────────────────────────
+# TYPING
+# ──────────────────────────────────────────
+async def keep_uploading_action(chat_id: int, bot):
     try:
         while True:
             await bot.send_chat_action(chat_id=chat_id, action="upload_video")
@@ -162,7 +187,10 @@ async def keep_uploading_action(chat_id, bot):
         pass
 
 
-def check_rate_limit(user_id):
+# ──────────────────────────────────────────
+# RATE LIMIT
+# ──────────────────────────────────────────
+def check_rate_limit(user_id: int):
     now = time.time()
     if user_id not in user_timestamps:
         user_timestamps[user_id] = deque()
@@ -178,6 +206,9 @@ def check_rate_limit(user_id):
     return True, 0
 
 
+# ──────────────────────────────────────────
+# HANDLER
+# ──────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or not message.text:
@@ -187,7 +218,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not url_info:
         return
 
-    media_url, platform, _ = url_info
+    user_id = message.from_user.id
+    allowed, cooldown_mins = check_rate_limit(user_id)
+    if not allowed:
+        err = await message.reply_text(
+            f"Забагато запитів. Спробуй через {cooldown_mins} хв.",
+            reply_to_message_id=message.message_id
+        )
+        await asyncio.sleep(10)
+        try: await err.delete()
+        except Exception: pass
+        return
+
+    media_url, platform, content_type = url_info
 
     typing_task = asyncio.create_task(
         keep_uploading_action(message.chat_id, context.bot)
@@ -203,38 +246,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await message.reply_text("Не вдалося завантажити.")
                 return
 
-            # 🔥 конвертація
+            # 🔥 ЄДИНА НОВА ЛІНІЯ
             media_path = await asyncio.get_event_loop().run_in_executor(
                 None, convert_to_ios_compatible, media_path
             )
-
-            if not media_path or not Path(media_path).exists():
-                await message.reply_text("Помилка обробки відео.")
-                return
 
             size_mb = Path(media_path).stat().st_size / 1024 / 1024
             if size_mb > 50:
                 await message.reply_text("Файл >50MB")
                 return
 
-            with open(media_path, "rb") as f:
-                await context.bot.send_video(
-                    chat_id=message.chat_id,
-                    video=f,
-                    supports_streaming=True
-                )
+            sent = False
+            for _ in range(3):
+                try:
+                    with open(media_path, "rb") as f:
+                        await context.bot.send_video(
+                            chat_id=message.chat_id,
+                            video=f,
+                            supports_streaming=True,
+                        )
+                    sent = True
+                    break
+                except:
+                    await asyncio.sleep(3)
+
+            if sent:
+                try: await message.delete()
+                except Exception: pass
 
     finally:
         typing_task.cancel()
 
 
 def create_application():
-    if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN не встановлено!")
-
     _init_cookies()
-
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
     return app

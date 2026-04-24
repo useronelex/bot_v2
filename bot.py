@@ -75,7 +75,7 @@ def extract_url(text: str) -> tuple[str, str, str] | None:
 
 
 # ──────────────────────────────────────────
-# 🔥 FIX ДЛЯ iPHONE
+#  FIX ДЛЯ iPHONE
 # ──────────────────────────────────────────
 def convert_to_ios_compatible(input_path: str) -> str:
     import subprocess
@@ -87,31 +87,20 @@ def convert_to_ios_compatible(input_path: str) -> str:
         "-y",
         "-i", input_path,
 
-        "-c:v", "libx264",
-        "-profile:v", "main",
-        "-level", "4.0",
-        "-pix_fmt", "yuv420p",
+        # ❗ БЕЗ перекодування
+        "-c", "copy",
 
-        "-r", "30",
-        "-g", "30",
-        "-keyint_min", "30",
-        "-sc_threshold", "0",
-        "-force_key_frames", "0",
-
-        "-preset", "fast",
-        "-crf", "23",
-
-        "-vf", "scale='min(1280,iw)':-2",
-
-        "-c:a", "aac",
-        "-b:a", "128k",
-
+        # 🔥 критично для iPhone / Telegram
         "-movflags", "+faststart",
 
         output_path
     ]
 
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    if result.returncode != 0:
+        logger.error(f"FFmpeg remux error: {result.stderr.decode()[:300]}")
+        return input_path
 
     return output_path if Path(output_path).exists() else input_path
 

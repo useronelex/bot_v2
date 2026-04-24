@@ -85,6 +85,45 @@ def _init_cookies() -> None:
     logger.info(f"Instagram cookies: {count} шт.")
 
 
+#___________________________________
+# FFPROBE
+#___________________________________
+def get_video_info(path: str):
+    import subprocess
+    import json
+
+    cmd = [
+        "ffprobe",
+        "-v", "quiet",
+        "-print_format", "json",
+        "-show_format",
+        "-show_streams",
+        path
+    ]
+
+    result = subprocess.run(cmd, stdout=subprocess.PIPE)
+    data = json.loads(result.stdout)
+
+    video_stream = None
+
+    for stream in data["streams"]:
+        if stream["codec_type"] == "video":
+            video_stream = stream
+            break
+
+    if not video_stream:
+        return None
+
+    duration = data.get("format", {}).get("duration")
+
+    return {
+        "width": video_stream.get("width"),
+        "height": video_stream.get("height"),
+        "duration": float(duration) if duration else None
+    }
+
+
+
 # ──────────────────────────────────────────
 # URL EXTRACTOR
 # ──────────────────────────────────────────
@@ -342,6 +381,7 @@ async def handle_message(
 
             for attempt in range(3):
                 try:
+                    """
                     with open(media_path, "rb") as f:
                         await context.bot.send_video(
                             chat_id=message.chat_id,
@@ -350,6 +390,20 @@ async def handle_message(
                             write_timeout=120,
                             read_timeout=60,
                             connect_timeout=30,
+                        )
+                    """
+                    info = await asyncio.get_event_loop().run_in_executor(
+                        None, get_video_info, media_path
+                    )
+                    
+                    with open(media_path, "rb") as f:
+                        await context.bot.send_video(
+                            chat_id=message.chat_id,
+                            video=f,
+                            supports_streaming=True,
+                            width=info["width"] if info else None,
+                            height=info["height"] if info else None,
+                            duration=int(info["duration"]) if info else None,
                         )
 
                     logger.info(

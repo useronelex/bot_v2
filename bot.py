@@ -6,10 +6,8 @@ import tempfile
 import time
 from collections import deque
 from pathlib import Path
-
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
-
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -17,44 +15,35 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 # ──────────────────────────────────────────
 # RATE LIMIT
 # ──────────────────────────────────────────
-REQUEST_LIMIT = 50
+REQUEST_LIMIT  = 50
 REQUEST_WINDOW = 3600
-COOLDOWN_TIME = 1800
-
+COOLDOWN_TIME  = 1800
 user_timestamps: dict[int, deque] = {}
-user_cooldowns: dict[int, float] = {}
-
+user_cooldowns:  dict[int, float] = {}
 
 # ──────────────────────────────────────────
 # CONFIG
 # ──────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 INSTAGRAM_COOKIES_RAW = os.environ.get("INSTAGRAM_COOKIES", "")
-
 _COOKIES_FILE: str | None = None
-
 
 # ──────────────────────────────────────────
 # URL PATTERNS
 # ──────────────────────────────────────────
 INSTAGRAM_POST_PATTERN = re.compile(
-    r"https?://(?:www\.)?instagram\.com/(?:reels?|p|tv)/([A-Za-z0-9_\-]+)(?:/[^\s]*)?"
+    r'https?://(?:www\.)?instagram\.com/(?:reels?|p|tv)/([A-Za-z0-9_\-]+)(?:/[^\s]*)?'
 )
-
 INSTAGRAM_STORY_PATTERN = re.compile(
-    r"https?://(?:www\.)?instagram\.com/stories/([A-Za-z0-9_\.]+)/(\d+)(?:/[^\s]*)?"
+    r'https?://(?:www\.)?instagram\.com/stories/([A-Za-z0-9_\.]+)/(\d+)(?:/[^\s]*)?'
 )
-
 FACEBOOK_URL_PATTERN = re.compile(
-    r"https?://(?:www\.|m\.|web\.)?facebook\.com/"
-    r"(?:watch/?\?v=|[\w\-\.]+/videos/|share/[vr]/)[\d\w\-]+"
+    r'https?://(?:www\.|m\.|web\.)?facebook\.com/(?:watch/?\?v=|[\w\-\.]+/videos/|share/[vr]/)[\d\w\-]+'
 )
-
 
 # ──────────────────────────────────────────
 # COOKIES INIT
@@ -62,28 +51,24 @@ FACEBOOK_URL_PATTERN = re.compile(
 def _init_cookies() -> None:
     """
     Зберігає cookies з env-змінної у тимчасовий файл.
+    gallery-dl читає cookies у форматі Netscape.
+
+    Як отримати cookies:
+      1. Встанови розширення "Cookie-Editor" в Chrome
+      2. Відкрий instagram.com будучи залогіненим
+      3. Cookie-Editor -> Export -> Netscape format
+      4. Вміст файлу -> INSTAGRAM_COOKIES на Render
     """
     global _COOKIES_FILE
-
     if not INSTAGRAM_COOKIES_RAW:
         logger.warning("INSTAGRAM_COOKIES не встановлено")
         return
-
     path = "/tmp/instagram_cookies.txt"
-
     with open(path, "w") as f:
         f.write(INSTAGRAM_COOKIES_RAW)
-
     _COOKIES_FILE = path
-
-    count = sum(
-        1
-        for l in INSTAGRAM_COOKIES_RAW.splitlines()
-        if l.strip() and not l.startswith("#")
-    )
-
+    count = sum(1 for l in INSTAGRAM_COOKIES_RAW.splitlines() if l.strip() and not l.startswith("#"))
     logger.info(f"Instagram cookies: {count} шт.")
-
 
 # ──────────────────────────────────────────
 # URL EXTRACTOR
@@ -92,40 +77,40 @@ def extract_url(text: str) -> tuple[str, str, str] | None:
     match = INSTAGRAM_STORY_PATTERN.search(text)
     if match:
         return (match.group(0), "instagram", "story")
-
     match = INSTAGRAM_POST_PATTERN.search(text)
     if match:
         return (match.group(0), "instagram", "post")
-
     match = FACEBOOK_URL_PATTERN.search(text)
     if match:
         return (match.group(0), "facebook", "facebook")
-
     return None
-
 
 # ──────────────────────────────────────────
 # INSTAGRAM — gallery-dl
 # ──────────────────────────────────────────
 def _download_instagram(url: str, output_dir: str) -> str | None:
+    """
+    gallery-dl — найстабільніший інструмент для Instagram.
+    Підтримує: пости, рілси, сторіз, 18+, приватний контент (з cookies).
+    Оновлюється кожні 1-2 тижні на GitHub.
+    Не логіниться через код — тільки використовує cookies існуючої сесії браузера.
+    """
     from gallery_dl import config as gdl_config, job as gdl_job
 
     gdl_config.clear()
     gdl_config.set((), "base-directory", output_dir)
-    gdl_config.set((), "directory", [])
-    gdl_config.set((), "filename", "video.{extension}")
-    gdl_config.set((), "sleep-request", 1.5)
+    gdl_config.set((), "directory",      [])
+    gdl_config.set((), "filename",       "video.{extension}")
+    gdl_config.set((), "sleep-request",  1.5)
 
-    gdl_config.set(("extractor", "instagram"), "videos", True)
-    gdl_config.set(("extractor", "instagram"), "reels", True)
+    gdl_config.set(("extractor", "instagram"), "videos",  True)
+    gdl_config.set(("extractor", "instagram"), "reels",   True)
     gdl_config.set(("extractor", "instagram"), "stories", True)
 
     gdl_config.set(
-        ("extractor",),
-        "user-agent",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        ("extractor",), "user-agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
 
     if _COOKIES_FILE:
@@ -138,14 +123,8 @@ def _download_instagram(url: str, output_dir: str) -> str | None:
         gdl_job.DownloadJob(url).run()
 
         for f in Path(output_dir).rglob("*"):
-            if (
-                f.suffix.lower() in (".mp4", ".mov", ".webm", ".mkv")
-                and f.stat().st_size > 0
-            ):
-                logger.info(
-                    f"gallery-dl OK: {f.name} "
-                    f"({f.stat().st_size / 1024 / 1024:.1f} MB)"
-                )
+            if f.suffix.lower() in (".mp4", ".mov", ".webm", ".mkv") and f.stat().st_size > 0:
+                logger.info(f"gallery-dl OK: {f.name} ({f.stat().st_size/1024/1024:.1f} MB)")
                 return str(f)
 
         logger.info("gallery-dl: відео не знайдено (фото?)")
@@ -153,16 +132,13 @@ def _download_instagram(url: str, output_dir: str) -> str | None:
 
     except Exception as e:
         msg = str(e).lower()
-
         if any(w in msg for w in ("private", "login", "restricted", "age")):
             logger.warning(f"gallery-dl: потрібна авторизація — {e}")
         elif any(w in msg for w in ("not found", "404", "deleted")):
             logger.warning(f"gallery-dl: контент не знайдено — {e}")
         else:
             logger.error(f"gallery-dl: {e}", exc_info=True)
-
         return None
-
 
 # ──────────────────────────────────────────
 # FACEBOOK — yt-dlp
@@ -170,42 +146,102 @@ def _download_instagram(url: str, output_dir: str) -> str | None:
 def _download_facebook(url: str, output_dir: str) -> str | None:
     try:
         import yt_dlp
-
         with yt_dlp.YoutubeDL({
-            "outtmpl": os.path.join(output_dir, "video.%(ext)s"),
-            "format": "best[ext=mp4]/best",
-            "quiet": True,
+            "outtmpl":     os.path.join(output_dir, "video.%(ext)s"),
+            "format":      "best[ext=mp4]/best",
+            "quiet":       True,
             "max_filesize": 50 * 1024 * 1024,
         }) as ydl:
             ydl.download([url])
-
         for f in Path(output_dir).glob("video.*"):
             if f.stat().st_size > 0:
                 return str(f)
-
         return None
-
     except Exception as e:
         logger.error(f"Facebook: {e}")
         return None
+
+# ──────────────────────────────────────────
+# FFMPEG КОНВЕРТАЦІЯ
+# ──────────────────────────────────────────
+def _convert_for_ios(input_path: str, output_dir: str) -> str:
+    """
+    Конвертує відео у формат сумісний з усіма пристроями включно з iPhone.
+
+    Чому iPhone показує статичну картинку:
+    - Instagram іноді віддає H.265/HEVC або yuv420p10le (10-bit)
+    - Telegram на iOS не вміє програвати ці формати inline
+    - Потрібен H.264 + yuv420p (8-bit) + faststart
+
+    Обмеження пам'яті Render (512MB):
+    - ffmpeg працює напряму з файлами, без Python буферизації
+    - threads=1 — менше RAM
+    - preset=faster — баланс швидкості і якості
+    """
+    import subprocess
+
+    input_path = Path(input_path)
+    output_path = Path(output_dir) / "converted.mp4"
+    target_size_kb = 9.5 * 1024  # 9.5 MB
+
+    # Визначаємо тривалість для розрахунку бітрейту
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(input_path)],
+        capture_output=True, text=True, timeout=30
+    )
+    try:
+        duration = float(probe.stdout.strip())
+    except (ValueError, AttributeError):
+        duration = 60.0
+
+    audio_kbps = 128
+    video_kbps = max(200, int((target_size_kb * 8) / duration) - audio_kbps)
+    input_mb = input_path.stat().st_size / 1024 / 1024
+
+    logger.info(f"ffmpeg: {input_mb:.1f}MB | {duration:.0f}s | vbr={video_kbps}kbps")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-c:v", "libx264",
+        "-preset", "faster",
+        "-profile:v", "baseline",   # максимальна сумісність iOS
+        "-level", "3.1",
+        "-pix_fmt", "yuv420p",      # 8-bit — iOS не підтримує 10-bit
+        "-b:v", f"{video_kbps}k",
+        "-c:a", "aac",
+        "-b:a", f"{audio_kbps}k",
+        "-movflags", "+faststart",  # streaming — відтворення без повного завантаження
+        "-threads", "1",            # економія RAM на Render
+        str(output_path)
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+
+    if result.returncode != 0:
+        logger.error(f"ffmpeg failed: {result.stderr[-300:]}")
+        return str(input_path)  # повертаємо оригінал якщо конвертація провалилась
+
+    out_mb = output_path.stat().st_size / 1024 / 1024
+    logger.info(f"ffmpeg OK: {input_mb:.1f}MB -> {out_mb:.1f}MB")
+    return str(output_path)
 
 
 # ──────────────────────────────────────────
 # DISPATCH
 # ──────────────────────────────────────────
-def download_media(
-    url: str,
-    output_dir: str,
-    platform: str
-) -> tuple[str | None, str]:
-
+def download_media(url: str, output_dir: str, platform: str) -> tuple[str | None, str]:
     if platform == "facebook":
         path = _download_facebook(url, output_dir)
-        return (path, "video") if path else (None, "unknown")
+    else:
+        path = _download_instagram(url, output_dir)
 
-    path = _download_instagram(url, output_dir)
-    return (path, "video") if path else (None, "unknown")
+    if not path:
+        return None, "unknown"
 
+    path = _convert_for_ios(path, output_dir)
+    return path, "video"
 
 # ──────────────────────────────────────────
 # TYPING
@@ -213,51 +249,35 @@ def download_media(
 async def keep_uploading_action(chat_id: int, bot) -> None:
     try:
         while True:
-            await bot.send_chat_action(
-                chat_id=chat_id,
-                action="upload_video"
-            )
+            await bot.send_chat_action(chat_id=chat_id, action="upload_video")
             await asyncio.sleep(4)
     except asyncio.CancelledError:
         pass
-
 
 # ──────────────────────────────────────────
 # RATE LIMIT
 # ──────────────────────────────────────────
 def check_rate_limit(user_id: int) -> tuple[bool, int]:
     now = time.time()
-
     cooldown = user_cooldowns.get(user_id, 0)
     if now < cooldown:
         return False, int((cooldown - now) / 60)
-
     if user_id not in user_timestamps:
         user_timestamps[user_id] = deque()
-
     ts = user_timestamps[user_id]
-
     while ts and ts[0] < now - REQUEST_WINDOW:
         ts.popleft()
-
     if len(ts) >= REQUEST_LIMIT:
         user_cooldowns[user_id] = now + COOLDOWN_TIME
         return False, COOLDOWN_TIME // 60
-
     ts.append(now)
     return True, 0
-
 
 # ──────────────────────────────────────────
 # HANDLER
 # ──────────────────────────────────────────
-async def handle_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-) -> None:
-
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
-
     if not message or not message.text:
         return
 
@@ -267,41 +287,25 @@ async def handle_message(
 
     user_id = message.from_user.id
     allowed, cooldown_mins = check_rate_limit(user_id)
-
     if not allowed:
         err = await message.reply_text(
             f"Забагато запитів. Спробуй через {cooldown_mins} хв.",
             reply_to_message_id=message.message_id
         )
-
         await asyncio.sleep(10)
-
-        try:
-            await err.delete()
-        except Exception:
-            pass
-
+        try: await err.delete()
+        except Exception: pass
         return
 
     media_url, platform, content_type = url_info
+    logger.info(f"[{platform.upper()}/{content_type}] user={user_id} | {media_url}")
 
-    logger.info(
-        f"[{platform.upper()}/{content_type}] "
-        f"user={user_id} | {media_url}"
-    )
-
-    typing_task = asyncio.create_task(
-        keep_uploading_action(message.chat_id, context.bot)
-    )
+    typing_task = asyncio.create_task(keep_uploading_action(message.chat_id, context.bot))
 
     try:
         with tempfile.TemporaryDirectory() as tmp_dir:
             media_path, _ = await asyncio.get_event_loop().run_in_executor(
-                None,
-                download_media,
-                media_url,
-                tmp_dir,
-                platform
+                None, download_media, media_url, tmp_dir, platform
             )
 
             if not media_path or not Path(media_path).exists():
@@ -310,38 +314,26 @@ async def handle_message(
                     "Можливо контент приватний, видалено або недоступний.",
                     reply_to_message_id=message.message_id
                 )
-
                 await asyncio.sleep(10)
-
-                try:
-                    await err.delete()
-                except Exception:
-                    pass
-
+                try: await err.delete()
+                except Exception: pass
                 return
 
             size_mb = Path(media_path).stat().st_size / 1024 / 1024
-
             if size_mb > 50:
                 err = await message.reply_text(
                     f"Файл завеликий ({size_mb:.0f} MB). Максимум 50 MB.",
                     reply_to_message_id=message.message_id
                 )
-
                 await asyncio.sleep(10)
-
-                try:
-                    await err.delete()
-                except Exception:
-                    pass
-
+                try: await err.delete()
+                except Exception: pass
                 return
 
             sent = False
             last_error = None
-
             for attempt in range(3):
-                try:                   
+                try:
                     with open(media_path, "rb") as f:
                         await context.bot.send_video(
                             chat_id=message.chat_id,
@@ -351,48 +343,29 @@ async def handle_message(
                             read_timeout=60,
                             connect_timeout=30,
                         )
-                                      
-                    logger.info(
-                        f"Sent {size_mb:.1f}MB (attempt {attempt + 1})"
-                    )
-
+                    logger.info(f"Sent {size_mb:.1f}MB (attempt {attempt+1})")
                     sent = True
                     break
-
                 except Exception as e:
                     last_error = e
-                    logger.warning(
-                        f"Send attempt {attempt + 1} failed: {e}"
-                    )
-
+                    logger.warning(f"Send attempt {attempt+1} failed: {e}")
                     if attempt < 2:
                         await asyncio.sleep(3)
 
             if sent:
-                try:
-                    await message.delete()
-                except Exception:
-                    pass
+                try: await message.delete()
+                except Exception: pass
             else:
-                logger.error(
-                    f"Send failed after 3 attempts: {last_error}"
-                )
-
+                logger.error(f"Send failed after 3 attempts: {last_error}")
                 err = await message.reply_text(
                     "Помилка при відправці. Спробуйте пізніше.",
                     reply_to_message_id=message.message_id
                 )
-
                 await asyncio.sleep(10)
-
-                try:
-                    await err.delete()
-                except Exception:
-                    pass
-
+                try: await err.delete()
+                except Exception: pass
     finally:
         typing_task.cancel()
-
 
 # ──────────────────────────────────────────
 # APP FACTORY
@@ -400,20 +373,9 @@ async def handle_message(
 def create_application() -> Application:
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN не встановлено!")
-
     _init_cookies()
-
     app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
-    )
-
-    logger.info(
-        "Бот запущено | Instagram (gallery-dl) + Facebook (yt-dlp)"
-    )
-    logger.info(
-        f"Cookies: {'OK' if _COOKIES_FILE else 'НЕ ВСТАНОВЛЕНО'}"
-    )
-
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    logger.info("Бот запущено | Instagram (gallery-dl) + Facebook (yt-dlp)")
+    logger.info(f"Cookies: {'OK' if _COOKIES_FILE else 'НЕ ВСТАНОВЛЕНО'}")
     return app

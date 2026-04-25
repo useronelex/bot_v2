@@ -190,80 +190,67 @@ def _get_video_info(input_path: str) -> dict:
 
 def _convert_for_ios(input_path: str, output_dir: str) -> str:
     """
-    Забезпечує сумісність відео з iOS та оптимальний розмір.
+    Єдина мета: сумісність з iOS/Telegram.
 
-    Стратегія (економія RAM на Render):
-    1. Якщо вже H.264 + yuv420p + < 10MB → тільки faststart (stream copy, миттєво)
-    2. Якщо несумісний кодек або 10-bit → перекодовуємо з CRF (без двопрохідного)
-    3. Якщо після перекодування > 10MB → обрізаємо бітрейт
+    Два сценарії:
+    1. H.264 + yuv420p (8-bit) → тільки faststart, без перекодування (1-2 сек)
+    2. Будь-який інший кодек (VP9, H.265, 10-bit) → перекодування у H.264
 
-    Чому CRF замість target bitrate:
-    - CRF = постійна якість, ffmpeg сам підбирає бітрейт
-    - Не потребує двох проходів → вдвічі менше часу і RAM
-    - CRF 28 дає ~30-40% від оригінального розміру при прийнятній якості
+    Розмір НЕ обмежуємо — конвертація повільніша ніж завантаження великого файлу.
+    Швидкість важливіша за розмір: preset=ultrafast.
     """
     import subprocess
 
     info = _get_video_info(input_path)
-    input_path_obj = Path(input_path)
     output_path = Path(output_dir) / "out.mp4"
     faststart_path = Path(output_dir) / "final.mp4"
 
     needs_reencode = (
         info["codec"] not in ("h264", "avc1") or
-        "10" in info["pix_fmt"] or           # 10-bit несумісний з iOS
+        "10" in info["pix_fmt"] or
         info["pix_fmt"] == "unknown"
     )
-    needs_resize = info["size_mb"] > 10.0
 
     logger.info(f"ffmpeg: codec={info['codec']} pix={info['pix_fmt']} "
-                f"size={info['size_mb']:.1f}MB reencode={needs_reencode} resize={needs_resize}")
+                f"size={info['size_mb']:.1f}MB reencode={needs_reencode}")
 
-    if not needs_reencode and not needs_resize:
-        # Тільки faststart — просто переміщуємо moov atom на початок
-        # Це майже миттєво і не їсть RAM
-        cmd = [
+    if not needs_reencode:
+        # Вже H.264 8-bit — тільки faststart (миттєво, без перекодування)
+        result = subprocess.run([
             "ffmpeg", "-y", "-i", input_path,
-            "-c", "copy",               # без перекодування
+            "-c", "copy",
             "-movflags", "+faststart",
             "-threads", "1",
             str(faststart_path)
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        ], capture_output=True, text=True, timeout=60)
+
         if result.returncode == 0:
-            logger.info("ffmpeg: stream copy + faststart OK")
+            logger.info("ffmpeg: faststart OK (no reencode)")
             return str(faststart_path)
-        # Якщо навіть copy провалився — повертаємо оригінал
         return input_path
 
-    # Потрібне перекодування — CRF для балансу якість/розмір
-    # CRF 26 = гарна якість (~50% розміру), CRF 30 = прийнятна (~30%)
-    crf = "26" if info["size_mb"] < 20 else "30"
-
-    cmd = [
+    # Перекодування: ultrafast = максимальна швидкість, мінімум RAM
+    # Якість трохи нижча ніж veryfast, але для мобільного перегляду непомітно
+    result = subprocess.run([
         "ffmpeg", "-y", "-i", input_path,
         "-c:v", "libx264",
-        "-preset", "veryfast",          # veryfast швидше ніж faster, менше RAM
-        "-profile:v", "baseline",       # iOS сумісність
+        "-preset", "ultrafast",      # найшвидший preset
+        "-profile:v", "baseline",   # максимальна сумісність iOS
         "-level", "3.1",
-        "-pix_fmt", "yuv420p",          # 8-bit — обов'язково для iOS
-        "-crf", crf,                    # постійна якість без двох проходів
-        "-maxrate", "2000k",            # жорсткий ліміт пікового бітрейту
-        "-bufsize", "4000k",
+        "-pix_fmt", "yuv420p",       # 8-bit обов'язково
+        "-crf", "23",                # стандартна якість без обмеження розміру
         "-c:a", "aac", "-b:a", "96k",
         "-movflags", "+faststart",
         "-threads", "1",
         str(output_path)
-    ]
-
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    ], capture_output=True, text=True, timeout=300)
 
     if result.returncode != 0:
-        logger.error(f"ffmpeg reencode failed: {result.stderr[-200:]}")
+        logger.error(f"ffmpeg failed: {result.stderr[-200:]}")
         return input_path
 
     out_mb = output_path.stat().st_size / 1024 / 1024
-    logger.info(f"ffmpeg reencode OK: {info['size_mb']:.1f}MB -> {out_mb:.1f}MB (CRF={crf})")
+    logger.info(f"ffmpeg reencode OK: {info['size_mb']:.1f}MB -> {out_mb:.1f}MB")
     return str(output_path)
 
 

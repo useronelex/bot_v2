@@ -7,7 +7,8 @@ import time
 from collections import deque
 from pathlib import Path
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+from collections import defaultdict
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -27,10 +28,18 @@ user_cooldowns:  dict[int, float] = {}
 # ──────────────────────────────────────────
 # CONFIG
 # ──────────────────────────────────────────
-BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+BOT_TOKEN      = os.environ.get("BOT_TOKEN", "")
+WEBHOOK_URL    = os.environ.get("WEBHOOK_URL", "")
 INSTAGRAM_COOKIES_RAW = os.environ.get("INSTAGRAM_COOKIES", "")
 _COOKIES_FILE: str | None = None
+
+# Твій Telegram user_id — отримай через @userinfobot
+# Тільки цей користувач може давати команди боту
+ADMIN_USER_ID  = int(os.environ.get("ADMIN_USER_ID", "0"))
+
+# Зберігаємо message_id відправлених ботом відео: {chat_id: deque[message_id]}
+# deque з максимумом 200 — не їсть пам'ять
+_sent_messages: dict[int, deque] = defaultdict(lambda: deque(maxlen=200))
 
 # ──────────────────────────────────────────
 # URL PATTERNS
@@ -331,6 +340,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not url_info:
         return
 
+    # Ігноруємо старі повідомлення — захист від спаму після перезапуску бота
+    # Telegram може накопичити і надіслати всі непрочитані повідомлення одразу
+    msg_age = time.time() - message.date.timestamp()
+    if msg_age > 30:
+        logger.info(f"Skipped old message (age={msg_age:.0f}s): {message.text[:50]}")
+        return
+
     user_id = message.from_user.id
     allowed, cooldown_mins = check_rate_limit(user_id)
     if not allowed:
@@ -388,7 +404,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             for attempt in range(3):
                 try:
                     with open(media_path, "rb") as f:
-                        await context.bot.send_video(
+                        sent_msg = await context.bot.send_video(
                             chat_id=message.chat_id,
                             video=f,
                             supports_streaming=True,
@@ -396,6 +412,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                             read_timeout=60,
                             connect_timeout=30,
                         )
+                    # Зберігаємо message_id для команди /clean
+                    _sent_messages[message.chat_id].append(sent_msg.message_id)
                     logger.info(f"Sent {size_mb:.1f}MB (attempt {attempt+1})")
                     sent = True
                     break
@@ -422,6 +440,96 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         _processing.discard(dedup_key)
 
 # ──────────────────────────────────────────
+# ADMIN КОМАНДИ
+# ──────────────────────────────────────────
+async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /clean [N|all] [chat_id]
+
+    Видаляє останні N відео бота з групи.
+    Працює тільки в особистих повідомленнях від адміна.
+
+    Приклади:
+      /clean         — видалити останні 5
+      /clean 10      — видалити останні 10
+      /clean all     — видалити всі збережені (до 200)
+      /clean all -1001234567890  — вказати конкретний chat_id групи
+    """
+    if not update.message:
+        return
+
+    # Перевіряємо що це адмін
+    if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("⛔ Немає доступу.")
+        return
+
+    # Парсимо аргументи
+    args = context.args or []
+    count_arg = args[0] if args else "5"
+    # Якщо передано chat_id як другий аргумент
+    chat_id_arg = int(args[1]) if len(args) > 1 else None
+
+    # Знаходимо чат з повідомленнями
+    if chat_id_arg:
+        target_chat = chat_id_arg
+    elif _sent_messages:
+        # Беремо перший доступний чат
+        target_chat = next(iter(_sent_messages))
+    else:
+        await update.message.reply_text("Немає збережених повідомлень.")
+        return
+
+    msgs = _sent_messages.get(target_chat)
+    if not msgs:
+        await update.message.reply_text(f"Немає повідомлень для чату {target_chat}.")
+        return
+
+    # Визначаємо скільки видаляти
+    all_msgs = list(msgs)
+    if count_arg.lower() == "all":
+        to_delete = all_msgs
+    else:
+        try:
+            n = int(count_arg)
+        except ValueError:
+            n = 5
+        to_delete = all_msgs[-n:]  # останні N
+
+    deleted = 0
+    failed = 0
+    for msg_id in reversed(to_delete):
+        try:
+            await context.bot.delete_message(chat_id=target_chat, message_id=msg_id)
+            msgs.remove(msg_id) if msg_id in msgs else None
+            deleted += 1
+            await asyncio.sleep(0.3)  # пауза щоб не перевищити rate limit Telegram
+        except Exception as e:
+            logger.warning(f"Cannot delete {msg_id}: {e}")
+            failed += 1
+
+    chats_info = ", ".join(f"{cid}: {len(v)}" for cid, v in _sent_messages.items())
+    chats_info = ", ".join(f"{cid}: {len(v)}" for cid, v in _sent_messages.items())
+    await update.message.reply_text(
+        f"OK: {deleted} | Fail: {failed} | Memory: {chats_info or empty}"
+    )
+
+
+async def cmd_chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/chats — список чатів де бот має збережені повідомлення."""
+    if not update.message or update.effective_user.id != ADMIN_USER_ID:
+        return
+    if not _sent_messages:
+        await update.message.reply_text("Немає збережених повідомлень.")
+        return
+    lines = ["Чати з повідомленнями бота:"]
+    for cid, msgs in _sent_messages.items():
+        lines.append(f"  {cid}: {len(msgs)} шт.")
+    lines.append("")
+    lines.append("Використай: /clean [N|all] [chat_id]")
+    await update.message.reply_text("\n".join(lines))
+
+
+# ──────────────────────────────────────────
 # APP FACTORY
 # ──────────────────────────────────────────
 def create_application() -> Application:
@@ -430,6 +538,8 @@ def create_application() -> Application:
     _init_cookies()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CommandHandler("clean", cmd_clean))
+    app.add_handler(CommandHandler("chats", cmd_chats))
     logger.info("Бот запущено | Instagram (gallery-dl) + Facebook (yt-dlp)")
     logger.info(f"Cookies: {'OK' if _COOKIES_FILE else 'НЕ ВСТАНОВЛЕНО'}")
     return app

@@ -106,6 +106,9 @@ def _download_instagram(url: str, output_dir: str) -> str | None:
     gdl_config.set(("extractor", "instagram"), "videos",  True)
     gdl_config.set(("extractor", "instagram"), "reels",   True)
     gdl_config.set(("extractor", "instagram"), "stories", True)
+    # Пріоритет mp4 — gallery-dl обере H.264 якщо доступний
+    gdl_config.set(("extractor", "instagram"), "filename", "{id}.{extension}")
+    gdl_config.set(("downloader", "ytdl"), "format", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best")
 
     gdl_config.set(
         ("extractor",), "user-agent",
@@ -231,14 +234,26 @@ def _convert_for_ios(input_path: str, output_dir: str) -> str:
 
     # Перекодування: ultrafast = максимальна швидкість, мінімум RAM
     # Якість трохи нижча ніж veryfast, але для мобільного перегляду непомітно
+    # Визначаємо розумний maxrate щоб ultrafast не роздував файл
+    # ultrafast має поганий компресор, тому без maxrate VP9 5MB → H264 16MB
+    info_size = info["size_mb"]
+    if info_size < 10:
+        maxrate = "1500k"
+    elif info_size < 30:
+        maxrate = "2500k"
+    else:
+        maxrate = "4000k"
+
     result = subprocess.run([
         "ffmpeg", "-y", "-i", input_path,
         "-c:v", "libx264",
-        "-preset", "ultrafast",      # найшвидший preset
-        "-profile:v", "baseline",   # максимальна сумісність iOS
+        "-preset", "ultrafast",
+        "-profile:v", "baseline",
         "-level", "3.1",
-        "-pix_fmt", "yuv420p",       # 8-bit обов'язково
-        "-crf", "23",                # стандартна якість без обмеження розміру
+        "-pix_fmt", "yuv420p",
+        "-crf", "28",               # 28 замість 23 — менший файл, прийнятна якість
+        "-maxrate", maxrate,        # обмеження пікового бітрейту
+        "-bufsize", f"{int(maxrate[:-1]) * 2}k",
         "-c:a", "aac", "-b:a", "96k",
         "-movflags", "+faststart",
         "-threads", "1",
@@ -253,6 +268,11 @@ def _convert_for_ios(input_path: str, output_dir: str) -> str:
     logger.info(f"ffmpeg reencode OK: {info['size_mb']:.1f}MB -> {out_mb:.1f}MB")
     return str(output_path)
 
+
+# ──────────────────────────────────────────
+# DEDUPLICATION — запобігає повторній обробці одного URL
+# ──────────────────────────────────────────
+_processing: set[str] = set()
 
 # ──────────────────────────────────────────
 # DISPATCH
@@ -324,8 +344,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     media_url, platform, content_type = url_info
-    logger.info(f"[{platform.upper()}/{content_type}] user={user_id} | {media_url}")
 
+    # Дедуплікація — якщо цей URL вже обробляється, ігноруємо
+    dedup_key = f"{media_url}:{message.chat_id}"
+    if dedup_key in _processing:
+        logger.info(f"Duplicate skipped: {media_url}")
+        return
+    _processing.add(dedup_key)
+
+    logger.info(f"[{platform.upper()}/{content_type}] user={user_id} | {media_url}")
     typing_task = asyncio.create_task(keep_uploading_action(message.chat_id, context.bot))
 
     try:
@@ -392,6 +419,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 except Exception: pass
     finally:
         typing_task.cancel()
+        _processing.discard(dedup_key)
 
 # ──────────────────────────────────────────
 # APP FACTORY

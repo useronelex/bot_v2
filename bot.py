@@ -273,6 +273,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 except Exception: pass
                 return
 
+            # Отримуємо розміри відео для правильного відображення на всіх пристроях
+            width = height = None
+            try:
+                import subprocess, json as _json
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                     "-show_entries", "stream=width,height",
+                     "-of", "json", media_path],
+                    capture_output=True, text=True, timeout=10
+                )
+                stream = _json.loads(probe.stdout).get("streams", [{}])[0]
+                width  = stream.get("width")
+                height = stream.get("height")
+            except Exception:
+                pass
+
             # Відправка з retry
             sent = False
             for attempt in range(3):
@@ -282,6 +298,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                             chat_id=message.chat_id,
                             video=f,
                             supports_streaming=True,
+                            width=width,
+                            height=height,
                             write_timeout=120,
                             read_timeout=60,
                             connect_timeout=30,

@@ -145,74 +145,11 @@ def _download_ytdlp(url: str, output_dir: str, platform: str) -> str | None:
         return None
 
 # ──────────────────────────────────────────
-# МЕТОД 2: Cobalt (fallback при empty media response)
-# cobalt.tools — відкритий проєкт, активно підтримується
-# ──────────────────────────────────────────
-def _download_cobalt(url: str, output_dir: str) -> str | None:
-    try:
-        import urllib.request
-        import json
-
-        payload = json.dumps({
-            "url": url,
-            "videoQuality": "720",
-            "youtubeVideoCodec": "h264",
-            "twitterGif": False,
-            "tiktokFullAudio": False,
-        }).encode()
-
-        req = urllib.request.Request(
-            "https://api.cobalt.tools/",
-            data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "Accept":       "application/json",
-                "User-Agent":   "Mozilla/5.0",
-            },
-            method="POST"
-        )
-
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read())
-
-        status = data.get("status")
-        if status not in ("stream", "redirect", "tunnel"):
-            logger.warning(f"Cobalt: статус={status} | {data.get('error', {}).get('code', '')}")
-            return None
-
-        video_url = data.get("url")
-        if not video_url:
-            logger.warning("Cobalt: немає URL у відповіді")
-            return None
-
-        output_path = os.path.join(output_dir, "video_cobalt.mp4")
-        req2 = urllib.request.Request(video_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req2, timeout=60) as r, open(output_path, "wb") as f:
-            f.write(r.read())
-
-        size_mb = Path(output_path).stat().st_size / 1024 / 1024
-        if size_mb < 0.01:
-            logger.warning("Cobalt: файл порожній")
-            return None
-
-        logger.info(f"Cobalt OK: {size_mb:.1f}MB")
-        return output_path
-
-    except Exception as e:
-        logger.warning(f"Cobalt: {e}")
-        return None
-
-# ──────────────────────────────────────────
-# DISPATCH: yt-dlp → Cobalt fallback
+# DISPATCH
 # ──────────────────────────────────────────
 def download_media(url: str, output_dir: str, platform: str) -> str | None:
     logger.info(f"yt-dlp: {'cookies активні' if _COOKIES_FILE else 'без cookies'} | {platform} | {url}")
     result = _download_ytdlp(url, output_dir, platform)
-
-    if result == _EMPTY_RESPONSE and platform == "instagram":
-        logger.info("Cobalt fallback...")
-        result = _download_cobalt(url, output_dir)
-
     return result if result and result != _EMPTY_RESPONSE else None
 
 # ──────────────────────────────────────────

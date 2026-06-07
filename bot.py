@@ -25,34 +25,24 @@ ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID") or "0")
 INSTAGRAM_COOKIES_RAW = os.environ.get("INSTAGRAM_COOKIES", "")
 _COOKIES_FILE: str | None = None
 
-# Rate limit
 REQUEST_LIMIT  = 50
 REQUEST_WINDOW = 3600
 COOLDOWN_TIME  = 1800
 user_timestamps: dict[int, deque] = {}
 user_cooldowns:  dict[int, float] = {}
 
-# Дедуплікація
 _processing: set[str] = set()
-
-# Зберігаємо message_id відео бота для команди /clean
 _sent_messages: dict[int, deque] = defaultdict(lambda: deque(maxlen=200))
 
 # ──────────────────────────────────────────
 # URL PATTERNS
-# Покриває всі варіанти Instagram і Facebook посилань
 # ──────────────────────────────────────────
 INSTAGRAM_PATTERNS = [
-    # Стандартні пости, reels, tv
     re.compile(r'https?://(?:www\.)?instagram\.com/(?:p|reel|reels|tv)/([A-Za-z0-9_\-]+)/?'),
-    # Сторіз
     re.compile(r'https?://(?:www\.)?instagram\.com/stories/([A-Za-z0-9_\.]+)/(\d+)/?'),
-    # Короткі посилання
     re.compile(r'https?://instagr\.am/(?:p|reel)/([A-Za-z0-9_\-]+)/?'),
-    # Share посилання з параметрами
     re.compile(r'https?://(?:www\.)?instagram\.com/(?:p|reel|reels|tv)/([A-Za-z0-9_\-]+)/\?'),
 ]
-
 FACEBOOK_PATTERNS = [
     re.compile(r'https?://(?:www\.|m\.|web\.)?facebook\.com/watch/?\?v=[\d]+'),
     re.compile(r'https?://(?:www\.|m\.|web\.)?facebook\.com/[\w\.\-]+/videos/[\d\w\-]+'),
@@ -61,7 +51,6 @@ FACEBOOK_PATTERNS = [
 ]
 
 def extract_url(text: str) -> tuple[str, str] | None:
-    """Повертає (url, platform) або None."""
     for pattern in INSTAGRAM_PATTERNS:
         match = pattern.search(text)
         if match:
@@ -78,48 +67,39 @@ def extract_url(text: str) -> tuple[str, str] | None:
 def _init_cookies() -> None:
     global _COOKIES_FILE
     if not INSTAGRAM_COOKIES_RAW:
-        logger.warning("INSTAGRAM_COOKIES не встановлено — тільки публічний контент")
+        logger.warning("INSTAGRAM_COOKIES не встановлено")
         return
     path = "/tmp/instagram_cookies.txt"
     with open(path, "w") as f:
         f.write(INSTAGRAM_COOKIES_RAW)
     _COOKIES_FILE = path
-    count = sum(
-        1 for line in INSTAGRAM_COOKIES_RAW.splitlines()
-        if line.strip() and not line.startswith("#")
-    )
+    count = sum(1 for l in INSTAGRAM_COOKIES_RAW.splitlines() if l.strip() and not l.startswith("#"))
     logger.info(f"Cookies завантажено: {count} шт.")
 
 # ──────────────────────────────────────────
-# DOWNLOADER — yt-dlp з cookies
-# H264 через format selector — без конвертації
+# МЕТОД 1: yt-dlp
 # ──────────────────────────────────────────
-def download_media(url: str, output_dir: str, platform: str) -> str | None:
+_EMPTY_RESPONSE = "EMPTY_RESPONSE"
+
+def _download_ytdlp(url: str, output_dir: str, platform: str) -> str | None:
     import yt_dlp
 
-    output_template = os.path.join(output_dir, "video.%(ext)s")
-
-    # Format selector:
-    # 1. H264 відео + m4a аудіо (найкраща якість сумісна з iOS)
-    # 2. Будь-який mp4
-    # 3. Найкраще доступне
     fmt = (
         "bestvideo[vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]/"
         "bestvideo[vcodec^=avc]+bestaudio/"
         "best[ext=mp4]/"
         "best"
     )
-
     ydl_opts = {
-        "outtmpl":          output_template,
-        "format":           fmt,
+        "outtmpl":             os.path.join(output_dir, "video.%(ext)s"),
+        "format":              fmt,
         "merge_output_format": "mp4",
-        "quiet":            True,
-        "no_warnings":      True,
-        "socket_timeout":   30,
-        "retries":          3,
-        "fragment_retries": 3,
-        # Мобільний User-Agent — Instagram віддає H264 мобільним клієнтам
+        "quiet":               True,
+        "no_warnings":         True,
+        "noprogress":          True,
+        "socket_timeout":      30,
+        "retries":             3,
+        "fragment_retries":    3,
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -127,56 +107,113 @@ def download_media(url: str, output_dir: str, platform: str) -> str | None:
                 "Mobile/15E148 Safari/604.1"
             ),
         },
-        # postprocessor для faststart — moov atom на початку файлу
-        # це критично для Telegram iOS щоб відео грало без повного завантаження
-        "postprocessors": [{
-            "key": "FFmpegVideoConvertor",
-            "preferedformat": "mp4",
-        }],
-        "postprocessor_args": {
-            "ffmpegvideoconvertor": ["-movflags", "+faststart"],
-        },
+        "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}],
+        "postprocessor_args": {"ffmpegvideoconvertor": ["-movflags", "+faststart"]},
     }
-
-    # Додаємо cookies якщо є — для приватного контенту і 18+
     if _COOKIES_FILE:
         ydl_opts["cookiefile"] = _COOKIES_FILE
-        logger.info(f"yt-dlp: cookies активні | {platform} | {url}")
-    else:
-        logger.info(f"yt-dlp: без cookies | {platform} | {url}")
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             if not info:
-                logger.warning("yt-dlp: extract_info повернув None")
                 return None
-
-        # Шукаємо завантажений файл
         for f in Path(output_dir).glob("video.*"):
             if f.stat().st_size > 0:
-                size_mb = f.stat().st_size / 1024 / 1024
-                codec = info.get("vcodec", "unknown")
-                logger.info(f"yt-dlp OK: {f.name} | {size_mb:.1f}MB | codec={codec}")
+                logger.info(f"yt-dlp OK: {f.name} | {f.stat().st_size/1024/1024:.1f}MB | codec={info.get('vcodec','?')}")
                 return str(f)
-
-        logger.warning("yt-dlp: файл не знайдено після завантаження")
         return None
 
     except yt_dlp.utils.DownloadError as e:
         err = str(e).lower()
-        if "private" in err or "login" in err or "age" in err:
-            logger.warning(f"yt-dlp: потрібна авторизація — {e}")
-        elif "not found" in err or "404" in err or "does not exist" in err:
-            logger.warning(f"yt-dlp: контент не знайдено — {e}")
+        if "empty media response" in err:
+            logger.warning("yt-dlp: empty media response — спробуємо Cobalt")
+            return _EMPTY_RESPONSE
+        if "private" in err or "login" in err or "age" in err or "rate-limit" in err:
+            logger.warning(f"yt-dlp: авторизація/ліміт — {str(e)[:120]}")
+        elif "not found" in err or "404" in err:
+            logger.warning(f"yt-dlp: не знайдено — {str(e)[:120]}")
         elif "no video" in err or "photo" in err:
-            logger.info(f"yt-dlp: це фото пост — {e}")
+            logger.info("yt-dlp: фото пост")
+        elif "can't be seen" in err or "isn't available" in err or "certain audiences" in err:
+            logger.warning("yt-dlp: контент обмежено (18+/гео)")
         else:
-            logger.error(f"yt-dlp DownloadError: {e}")
+            logger.error(f"yt-dlp: {str(e)[:200]}")
         return None
     except Exception as e:
         logger.error(f"yt-dlp Exception: {e}", exc_info=True)
         return None
+
+# ──────────────────────────────────────────
+# МЕТОД 2: Cobalt (fallback при empty media response)
+# cobalt.tools — відкритий проєкт, активно підтримується
+# ──────────────────────────────────────────
+def _download_cobalt(url: str, output_dir: str) -> str | None:
+    try:
+        import urllib.request
+        import json
+
+        payload = json.dumps({
+            "url": url,
+            "videoQuality": "720",
+            "youtubeVideoCodec": "h264",
+            "twitterGif": False,
+            "tiktokFullAudio": False,
+        }).encode()
+
+        req = urllib.request.Request(
+            "https://api.cobalt.tools/",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Accept":       "application/json",
+                "User-Agent":   "Mozilla/5.0",
+            },
+            method="POST"
+        )
+
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read())
+
+        status = data.get("status")
+        if status not in ("stream", "redirect", "tunnel"):
+            logger.warning(f"Cobalt: статус={status} | {data.get('error', {}).get('code', '')}")
+            return None
+
+        video_url = data.get("url")
+        if not video_url:
+            logger.warning("Cobalt: немає URL у відповіді")
+            return None
+
+        output_path = os.path.join(output_dir, "video_cobalt.mp4")
+        req2 = urllib.request.Request(video_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req2, timeout=60) as r, open(output_path, "wb") as f:
+            f.write(r.read())
+
+        size_mb = Path(output_path).stat().st_size / 1024 / 1024
+        if size_mb < 0.01:
+            logger.warning("Cobalt: файл порожній")
+            return None
+
+        logger.info(f"Cobalt OK: {size_mb:.1f}MB")
+        return output_path
+
+    except Exception as e:
+        logger.warning(f"Cobalt: {e}")
+        return None
+
+# ──────────────────────────────────────────
+# DISPATCH: yt-dlp → Cobalt fallback
+# ──────────────────────────────────────────
+def download_media(url: str, output_dir: str, platform: str) -> str | None:
+    logger.info(f"yt-dlp: {'cookies активні' if _COOKIES_FILE else 'без cookies'} | {platform} | {url}")
+    result = _download_ytdlp(url, output_dir, platform)
+
+    if result == _EMPTY_RESPONSE and platform == "instagram":
+        logger.info("Cobalt fallback...")
+        result = _download_cobalt(url, output_dir)
+
+    return result if result and result != _EMPTY_RESPONSE else None
 
 # ──────────────────────────────────────────
 # RATE LIMIT
@@ -198,7 +235,7 @@ def check_rate_limit(user_id: int) -> tuple[bool, int]:
     return True, 0
 
 # ──────────────────────────────────────────
-# TYPING INDICATOR
+# TYPING
 # ──────────────────────────────────────────
 async def keep_uploading_action(chat_id: int, bot) -> None:
     try:
@@ -209,17 +246,14 @@ async def keep_uploading_action(chat_id: int, bot) -> None:
         pass
 
 # ──────────────────────────────────────────
-# MAIN HANDLER
+# HANDLER
 # ──────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if not message or not message.text:
         return
-
-    # Захист від спаму після перезапуску — ігноруємо старі повідомлення
     if time.time() - message.date.timestamp() > 30:
         return
-
     url_info = extract_url(message.text)
     if not url_info:
         return
@@ -227,7 +261,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     media_url, platform = url_info
     user_id = message.from_user.id
 
-    # Rate limit
     allowed, cooldown_mins = check_rate_limit(user_id)
     if not allowed:
         err = await message.reply_text(f"Забагато запитів. Спробуй через {cooldown_mins} хв.")
@@ -236,10 +269,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception: pass
         return
 
-    # Дедуплікація
     dedup_key = f"{media_url}:{message.chat_id}"
     if dedup_key in _processing:
-        logger.info(f"Duplicate skipped: {media_url}")
         return
     _processing.add(dedup_key)
 
@@ -273,14 +304,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 except Exception: pass
                 return
 
-            # Отримуємо розміри відео для правильного відображення на всіх пристроях
             width = height = None
             try:
                 import subprocess, json as _json
                 probe = subprocess.run(
                     ["ffprobe", "-v", "error", "-select_streams", "v:0",
-                     "-show_entries", "stream=width,height",
-                     "-of", "json", media_path],
+                     "-show_entries", "stream=width,height", "-of", "json", media_path],
                     capture_output=True, text=True, timeout=10
                 )
                 stream = _json.loads(probe.stdout).get("streams", [{}])[0]
@@ -289,7 +318,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             except Exception:
                 pass
 
-            # Відправка з retry
             sent = False
             for attempt in range(3):
                 try:
@@ -329,31 +357,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         _processing.discard(dedup_key)
 
 # ──────────────────────────────────────────
-# ADMIN КОМАНДИ
+# ADMIN
 # ──────────────────────────────────────────
 async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/clean [N|all] [chat_id] — видалити останні N відео бота з групи."""
     if not update.message or update.effective_user.id != ADMIN_USER_ID:
         await update.message.reply_text("Немає доступу.")
         return
-
     args = context.args or []
     count_arg = args[0] if args else "5"
     chat_id_arg = int(args[1]) if len(args) > 1 else None
-
     target_chat = chat_id_arg or (next(iter(_sent_messages)) if _sent_messages else None)
     if not target_chat:
         await update.message.reply_text("Немає збережених повідомлень.")
         return
-
     msgs = _sent_messages.get(target_chat)
     if not msgs:
         await update.message.reply_text(f"Немає повідомлень для чату {target_chat}.")
         return
-
     all_msgs = list(msgs)
     to_delete = all_msgs if count_arg.lower() == "all" else all_msgs[-(int(count_arg) if count_arg.isdigit() else 5):]
-
     deleted = failed = 0
     for msg_id in reversed(to_delete):
         try:
@@ -364,12 +386,9 @@ async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception as e:
             logger.warning(f"Cannot delete {msg_id}: {e}")
             failed += 1
-
     await update.message.reply_text(f"Видалено: {deleted} | Не вдалось: {failed}")
 
-
 async def cmd_chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/chats — список чатів де бот має збережені повідомлення."""
     if not update.message or update.effective_user.id != ADMIN_USER_ID:
         return
     if not _sent_messages:
@@ -390,7 +409,7 @@ def create_application() -> Application:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CommandHandler("clean", cmd_clean))
     app.add_handler(CommandHandler("chats", cmd_chats))
-    logger.info("Бот запущено | Instagram + Facebook (yt-dlp + cookies)")
+    logger.info("Бот запущено | yt-dlp + Cobalt fallback")
     logger.info(f"Cookies: {'OK' if _COOKIES_FILE else 'НЕ ВСТАНОВЛЕНО'}")
     logger.info(f"Admin: {ADMIN_USER_ID or 'не встановлено'}")
     return app

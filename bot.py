@@ -161,6 +161,9 @@ def _download_ytdlp(url: str, output_dir: str, platform: str) -> str | None:
 # DISPATCH
 # ──────────────────────────────────────────
 def download_media(url: str, output_dir: str, platform: str) -> str | None:
+    # yt-dlp підтримує threads.net, але не threads.com (новий домен Meta)
+    if platform == "threads":
+        url = url.replace("threads.com", "threads.net")
     logger.info(f"yt-dlp: {'cookies активні' if _COOKIES_FILE else 'без cookies'} | {platform} | {url}")
     result = _download_ytdlp(url, output_dir, platform)
     return result if result and result != _EMPTY_RESPONSE else None

@@ -6,6 +6,7 @@ import tempfile
 import time
 from collections import deque, defaultdict
 from pathlib import Path
+
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 
@@ -18,19 +19,18 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────
 # CONFIG
 # ──────────────────────────────────────────
-BOT_TOKEN     = os.environ.get("BOT_TOKEN", "")
-WEBHOOK_URL   = os.environ.get("WEBHOOK_URL", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID") or "0")
-
 INSTAGRAM_COOKIES_RAW = os.environ.get("INSTAGRAM_COOKIES", "")
 _COOKIES_FILE: str | None = None
 
-REQUEST_LIMIT  = 50
+REQUEST_LIMIT = 50
 REQUEST_WINDOW = 3600
-COOLDOWN_TIME  = 1800
-user_timestamps: dict[int, deque] = {}
-user_cooldowns:  dict[int, float] = {}
+COOLDOWN_TIME = 1800
 
+user_timestamps: dict[int, deque] = {}
+user_cooldowns: dict[int, float] = {}
 _processing: set[str] = set()
 _sent_messages: dict[int, deque] = defaultdict(lambda: deque(maxlen=200))
 
@@ -38,17 +38,28 @@ _sent_messages: dict[int, deque] = defaultdict(lambda: deque(maxlen=200))
 # URL PATTERNS
 # ──────────────────────────────────────────
 INSTAGRAM_PATTERNS = [
-    re.compile(r'https?://(?:www\.)?instagram\.com/(?:p|reel|reels|tv)/([A-Za-z0-9_\-]+)/?'),
-    re.compile(r'https?://(?:www\.)?instagram\.com/stories/([A-Za-z0-9_\.]+)/(\d+)/?'),
-    re.compile(r'https?://instagr\.am/(?:p|reel)/([A-Za-z0-9_\-]+)/?'),
-    re.compile(r'https?://(?:www\.)?instagram\.com/(?:p|reel|reels|tv)/([A-Za-z0-9_\-]+)/\?'),
+    re.compile(r'https?://(?:www\.)?instagram\.com/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)/?'),
+    re.compile(r'https?://(?:www\.)?instagram\.com/stories/([A-Za-z0-9_.]+)/(\d+)/?'),
+    re.compile(r'https?://instagr\.am/(?:p|reel)/([A-Za-z0-9_-]+)/?'),
 ]
+
 FACEBOOK_PATTERNS = [
     re.compile(r'https?://(?:www\.|m\.|web\.)?facebook\.com/watch/?\?v=[\d]+'),
-    re.compile(r'https?://(?:www\.|m\.|web\.)?facebook\.com/[\w\.\-]+/videos/[\d\w\-]+'),
-    re.compile(r'https?://(?:www\.|m\.|web\.)?facebook\.com/share/[vr]/[\w\-]+'),
-    re.compile(r'https?://fb\.watch/[\w\-]+'),
+    re.compile(r'https?://(?:www\.|m\.|web\.)?facebook\.com/[\w.-]+/videos/[\d\w-]+'),
+    re.compile(r'https?://(?:www\.|m\.|web\.)?facebook\.com/share/[vr]/[\w-]+'),
+    re.compile(r'https?://fb\.watch/[\w-]+'),
+    # Facebook Reels
+    re.compile(r'https?://(?:www\.|m\.|web\.)?facebook\.com/reels?/[\d]+'),
+    re.compile(r'https?://(?:www\.|m\.|web\.)?facebook\.com/[\w.-]+/reels?/[\d\w-]+'),
+    re.compile(r'https?://(?:www\.|m\.|web\.)?facebook\.com/share/r/[\w-]+'),
 ]
+
+# ★ НОВИЙ БЛОК — Threads
+THREADS_PATTERNS = [
+    re.compile(r'https?://(?:www\.)?threads\.(?:com|net)/@[\w.]+/post/[\w-]+'),
+    re.compile(r'https?://(?:www\.)?threads\.(?:com|net)/t/[\w-]+'),
+]
+
 
 def extract_url(text: str) -> tuple[str, str] | None:
     for pattern in INSTAGRAM_PATTERNS:
@@ -58,7 +69,12 @@ def extract_url(text: str) -> tuple[str, str] | None:
     for pattern in FACEBOOK_PATTERNS:
         match = pattern.search(text)
         if match:
-            return match.group(0), "facebook"
+            return match.group(0).split('?')[0], "facebook"
+    # ★ НОВИЙ БЛОК — Threads
+    for pattern in THREADS_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return match.group(0).split('?')[0].rstrip('/'), "threads"
     return None
 
 # ──────────────────────────────────────────
@@ -83,7 +99,6 @@ _EMPTY_RESPONSE = "EMPTY_RESPONSE"
 
 def _download_ytdlp(url: str, output_dir: str, platform: str) -> str | None:
     import yt_dlp
-
     fmt = (
         "bestvideo[vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]/"
         "bestvideo[vcodec^=avc]+bestaudio/"
@@ -91,15 +106,15 @@ def _download_ytdlp(url: str, output_dir: str, platform: str) -> str | None:
         "best"
     )
     ydl_opts = {
-        "outtmpl":             os.path.join(output_dir, "video.%(ext)s"),
-        "format":              fmt,
+        "outtmpl": os.path.join(output_dir, "video.%(ext)s"),
+        "format": fmt,
         "merge_output_format": "mp4",
-        "quiet":               True,
-        "no_warnings":         True,
-        "noprogress":          True,
-        "socket_timeout":      30,
-        "retries":             3,
-        "fragment_retries":    3,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "socket_timeout": 30,
+        "retries": 3,
+        "fragment_retries": 3,
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -112,18 +127,16 @@ def _download_ytdlp(url: str, output_dir: str, platform: str) -> str | None:
     }
     if _COOKIES_FILE:
         ydl_opts["cookiefile"] = _COOKIES_FILE
-
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             if not info:
                 return None
-        for f in Path(output_dir).glob("video.*"):
-            if f.stat().st_size > 0:
-                logger.info(f"yt-dlp OK: {f.name} | {f.stat().st_size/1024/1024:.1f}MB | codec={info.get('vcodec','?')}")
-                return str(f)
-        return None
-
+            for f in Path(output_dir).glob("video.*"):
+                if f.stat().st_size > 0:
+                    logger.info(f"yt-dlp OK: {f.name} | {f.stat().st_size/1024/1024:.1f}MB | codec={info.get('vcodec','?')}")
+                    return str(f)
+            return None
     except yt_dlp.utils.DownloadError as e:
         err = str(e).lower()
         if "empty media response" in err:
@@ -191,19 +204,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     if time.time() - message.date.timestamp() > 30:
         return
+
     url_info = extract_url(message.text)
     if not url_info:
         return
-
     media_url, platform = url_info
-    user_id = message.from_user.id
 
+    user_id = message.from_user.id
     allowed, cooldown_mins = check_rate_limit(user_id)
     if not allowed:
         err = await message.reply_text(f"Забагато запитів. Спробуй через {cooldown_mins} хв.")
         await asyncio.sleep(10)
-        try: await err.delete()
-        except Exception: pass
+        try:
+            await err.delete()
+        except Exception:
+            pass
         return
 
     dedup_key = f"{media_url}:{message.chat_id}"
@@ -213,21 +228,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     logger.info(f"[{platform.upper()}] user={user_id} | {media_url}")
     typing_task = asyncio.create_task(keep_uploading_action(message.chat_id, context.bot))
-
     try:
         with tempfile.TemporaryDirectory() as tmp_dir:
             media_path = await asyncio.get_event_loop().run_in_executor(
                 None, download_media, media_url, tmp_dir, platform
             )
-
             if not media_path or not Path(media_path).exists():
                 err = await message.reply_text(
                     "Не вдалося завантажити. Контент приватний, видалено або недоступний.",
                     reply_to_message_id=message.message_id
                 )
                 await asyncio.sleep(5)
-                try: await err.delete()
-                except Exception: pass
+                try:
+                    await err.delete()
+                except Exception:
+                    pass
                 return
 
             size_mb = Path(media_path).stat().st_size / 1024 / 1024
@@ -237,8 +252,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     reply_to_message_id=message.message_id
                 )
                 await asyncio.sleep(5)
-                try: await err.delete()
-                except Exception: pass
+                try:
+                    await err.delete()
+                except Exception:
+                    pass
                 return
 
             width = height = None
@@ -250,7 +267,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     capture_output=True, text=True, timeout=10
                 )
                 stream = _json.loads(probe.stdout).get("streams", [{}])[0]
-                width  = stream.get("width")
+                width = stream.get("width")
                 height = stream.get("height")
             except Exception:
                 pass
@@ -279,16 +296,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         await asyncio.sleep(3)
 
             if sent:
-                try: await message.delete()
-                except Exception: pass
+                try:
+                    await message.delete()
+                except Exception:
+                    pass
             else:
                 err = await message.reply_text(
                     "Помилка при відправці. Спробуйте пізніше.",
                     reply_to_message_id=message.message_id
                 )
                 await asyncio.sleep(5)
-                try: await err.delete()
-                except Exception: pass
+                try:
+                    await err.delete()
+                except Exception:
+                    pass
     finally:
         typing_task.cancel()
         _processing.discard(dedup_key)
@@ -317,13 +338,15 @@ async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     for msg_id in reversed(to_delete):
         try:
             await context.bot.delete_message(chat_id=target_chat, message_id=msg_id)
-            if msg_id in msgs: msgs.remove(msg_id)
+            if msg_id in msgs:
+                msgs.remove(msg_id)
             deleted += 1
             await asyncio.sleep(0.3)
         except Exception as e:
             logger.warning(f"Cannot delete {msg_id}: {e}")
             failed += 1
     await update.message.reply_text(f"Видалено: {deleted} | Не вдалось: {failed}")
+
 
 async def cmd_chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or update.effective_user.id != ADMIN_USER_ID:
@@ -346,7 +369,7 @@ def create_application() -> Application:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CommandHandler("clean", cmd_clean))
     app.add_handler(CommandHandler("chats", cmd_chats))
-    logger.info("Бот запущено | yt-dlp + Cobalt fallback")
+    logger.info("Бот запущено | yt-dlp (Instagram, Facebook Reels, Threads)")
     logger.info(f"Cookies: {'OK' if _COOKIES_FILE else 'НЕ ВСТАНОВЛЕНО'}")
     logger.info(f"Admin: {ADMIN_USER_ID or 'не встановлено'}")
     return app

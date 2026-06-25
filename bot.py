@@ -182,7 +182,6 @@ def _find_video_urls_in_json(obj: object, results: list | None = None) -> list:
 def _download_threads_api(url: str, output_dir: str) -> str | None:
     """Threads internal GraphQL API — не потребує зовнішніх сервісів."""
     import urllib.request
-    import urllib.parse
     import json as _json
 
     # 1. Витягуємо shortcode з URL
@@ -200,13 +199,7 @@ def _download_threads_api(url: str, output_dir: str) -> str | None:
             media_id = media_id * 64 + alphabet.index(c)
     logger.info(f"Threads API: shortcode={shortcode} → media_id={media_id}")
 
-    # 3. Пробуємо декілька doc_id (Meta може їх змінювати)
-    doc_id_variants = [
-        ("5587632691339264", "postID"),
-        ("9360915773983802", "mediaID"),
-    ]
-
-    # Читаємо Instagram cookies якщо є — допомагає з авторизацією
+    # 3. Читаємо Instagram cookies (Threads і Instagram — один бекенд Meta)
     cookie_header = ""
     if _COOKIES_FILE:
         try:
@@ -216,69 +209,66 @@ def _download_threads_api(url: str, output_dir: str) -> str | None:
                     if line.startswith("#") or not line.strip():
                         continue
                     parts = line.strip().split("\t")
-                    if len(parts) >= 7 and "instagram" in parts[0]:
+                    if len(parts) >= 7:
                         parts_list.append(f"{parts[5]}={parts[6]}")
             cookie_header = "; ".join(parts_list)
         except Exception:
             pass
 
-    for doc_id, var_key in doc_id_variants:
-        variables = _json.dumps({var_key: str(media_id)})
-        payload = urllib.parse.urlencode({
-            "variables": variables,
-            "doc_id": doc_id,
-        }).encode()
+    if not cookie_header:
+        logger.warning("Threads API: Instagram cookies відсутні — неможливо продовжити")
+        return None
 
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "threads-client",
-            "x-ig-app-id": "238260118697367",
-            "Accept": "application/json",
+    # 4. Instagram private API — стабільний роками, без doc_id, той самий бекенд
+    ig_mobile_ua = (
+        "Instagram 339.0.0.0.2 Android (31/12; 560dpi; 1440x3040; "
+        "samsung; SM-G998B; p3s; qcom; en_US; 572566893)"
+    )
+    req = urllib.request.Request(
+        f"https://i.instagram.com/api/v1/media/{media_id}/info/",
+        headers={
+            "User-Agent": ig_mobile_ua,
+            "X-IG-App-ID": "936619743392459",
+            "Cookie": cookie_header,
+            "Accept": "*/*",
+            "Accept-Language": "en-US",
         }
-        if cookie_header:
-            headers["Cookie"] = cookie_header
+    )
 
-        req = urllib.request.Request(
-            "https://www.threads.net/api/graphql",
-            data=payload,
-            method="POST",
-            headers=headers,
-        )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = _json.loads(resp.read())
+    except Exception as e:
+        logger.warning(f"Threads API: media/info request failed: {e}")
+        return None
 
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = _json.loads(resp.read())
-        except Exception as e:
-            logger.warning(f"Threads API: GraphQL request failed (doc_id={doc_id}): {e}")
-            continue
+    # 5. Шукаємо відео URL (video_versions — від найкращої до гіршої якості)
+    video_urls = _find_video_urls_in_json(data)
+    if not video_urls:
+        logger.warning("Threads API: відео URL не знайдено у відповіді")
+        return None
 
-        video_urls = _find_video_urls_in_json(data)
-        if not video_urls:
-            logger.warning(f"Threads API: відео URL не знайдено (doc_id={doc_id})")
-            continue
+    video_url = video_urls[0]
+    logger.info(f"Threads API: знайдено {len(video_urls)} URL(s), завантажуємо...")
 
-        # Беремо перший URL (зазвичай найкраща якість)
-        video_url = video_urls[0]
-        logger.info(f"Threads API: знайдено {len(video_urls)} відео URL(s), завантажуємо...")
+    # 6. Завантажуємо відео
+    try:
+        vid_req = urllib.request.Request(video_url, headers={
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+            "Referer": "https://www.threads.com/",
+        })
+        output_path = os.path.join(output_dir, "video.mp4")
+        with urllib.request.urlopen(vid_req, timeout=60) as resp, open(output_path, "wb") as f:
+            while chunk := resp.read(65536):
+                f.write(chunk)
 
-        # 4. Завантажуємо відео
-        try:
-            vid_req = urllib.request.Request(video_url, headers={
-                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
-                "Referer": "https://www.threads.com/",
-            })
-            output_path = os.path.join(output_dir, "video.mp4")
-            with urllib.request.urlopen(vid_req, timeout=60) as resp, open(output_path, "wb") as f:
-                while chunk := resp.read(65536):
-                    f.write(chunk)
-
-            size = os.path.getsize(output_path)
-            if size > 10000:
-                logger.info(f"Threads API OK: {size / 1024 / 1024:.1f}MB")
-                return output_path
-            logger.warning(f"Threads API: файл замалий ({size} bytes)")
-        except Exception as e:
-            logger.error(f"Threads API: download error: {e}")
+        size = os.path.getsize(output_path)
+        if size > 10000:
+            logger.info(f"Threads API OK: {size / 1024 / 1024:.1f}MB")
+            return output_path
+        logger.warning(f"Threads API: файл замалий ({size} bytes)")
+    except Exception as e:
+        logger.error(f"Threads API: download error: {e}")
 
     return None
 
@@ -294,8 +284,8 @@ def download_media(url: str, output_dir: str, platform: str) -> str | None:
         result = _download_ytdlp(ytdlp_url, output_dir, platform)
         if result and result != _EMPTY_RESPONSE:
             return result
-        # 2. Threads internal GraphQL API
-        logger.info("Threads: yt-dlp не впорався → GraphQL API")
+        # 2. Instagram private API (Threads і Instagram — один бекенд)
+        logger.info("Threads: yt-dlp не впорався → Instagram private API")
         return _download_threads_api(url, output_dir)
 
     logger.info(f"yt-dlp: {'cookies активні' if _COOKIES_FILE else 'без cookies'} | {platform} | {url}")

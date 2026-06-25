@@ -158,12 +158,101 @@ def _download_ytdlp(url: str, output_dir: str, platform: str) -> str | None:
         return None
 
 # ──────────────────────────────────────────
+# МЕТОД 2: Threads scraper (fallback)
+# ──────────────────────────────────────────
+def _download_threads_scraper(url: str, output_dir: str) -> str | None:
+    """Парсимо HTML сторінки Threads напряму — OG-теги або embedded JSON."""
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        logger.error(f"Threads scraper: HTTP помилка: {e}")
+        return None
+
+    video_url = None
+
+    # 1. OG video тег (server-side rendering для SEO)
+    for pattern in [
+        r'property=["\']og:video(?::url|:secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
+        r'content=["\']([^"\']+)["\'][^>]+property=["\']og:video(?::url|:secure_url)?["\']',
+    ]:
+        m = re.search(pattern, html)
+        if m:
+            video_url = m.group(1).replace("&amp;", "&")
+            logger.info("Threads scraper: знайдено через OG tag")
+            break
+
+    # 2. Embedded JSON — типові поля Meta/Instagram
+    if not video_url:
+        for pattern in [
+            r'"video_url"\s*:\s*"(https://[^"]+)"',
+            r'"playback_url"\s*:\s*"(https://[^"]+)"',
+            r'"browser_native_hd_url"\s*:\s*"(https://[^"]+)"',
+            r'"browser_native_sd_url"\s*:\s*"(https://[^"]+)"',
+            r'(https://[^"\'\\]+fbcdn\.net/[^"\'\\]+\.mp4[^"\'\\]*)',
+            r'(https://[^"\'\\]+cdninstagram\.com/[^"\'\\]+\.mp4[^"\'\\]*)',
+        ]:
+            m = re.search(pattern, html)
+            if m:
+                video_url = m.group(1).replace("\\u0026", "&").replace("\\/", "/")
+                logger.info("Threads scraper: знайдено через JSON embed")
+                break
+
+    if not video_url:
+        logger.warning("Threads scraper: відео URL не знайдено в HTML")
+        return None
+
+    logger.info(f"Threads scraper: завантажуємо {video_url[:80]}...")
+    try:
+        vid_req = urllib.request.Request(video_url, headers={
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+            "Referer": "https://www.threads.com/",
+        })
+        output_path = os.path.join(output_dir, "video.mp4")
+        with urllib.request.urlopen(vid_req, timeout=60) as resp, open(output_path, "wb") as f:
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                f.write(chunk)
+
+        size = os.path.getsize(output_path)
+        if size > 10000:
+            logger.info(f"Threads scraper OK: {size / 1024 / 1024:.1f}MB")
+            return output_path
+        logger.warning(f"Threads scraper: файл замалий ({size} bytes)")
+        return None
+    except Exception as e:
+        logger.error(f"Threads scraper: помилка завантаження: {e}")
+        return None
+
+
+# ──────────────────────────────────────────
 # DISPATCH
 # ──────────────────────────────────────────
 def download_media(url: str, output_dir: str, platform: str) -> str | None:
-    # yt-dlp підтримує threads.net, але не threads.com (новий домен Meta)
     if platform == "threads":
-        url = url.replace("threads.com", "threads.net")
+        # yt-dlp: спробуємо threads.net (yt-dlp не підтримує threads.com)
+        ytdlp_url = url.replace("threads.com", "threads.net")
+        logger.info(f"yt-dlp: {'cookies активні' if _COOKIES_FILE else 'без cookies'} | {platform} | {ytdlp_url}")
+        result = _download_ytdlp(ytdlp_url, output_dir, platform)
+        if result and result != _EMPTY_RESPONSE:
+            return result
+        # Fallback: прямий парсинг HTML
+        logger.info("Threads: yt-dlp не впорався, спробуємо scraper")
+        return _download_threads_scraper(url, output_dir)
+
     logger.info(f"yt-dlp: {'cookies активні' if _COOKIES_FILE else 'без cookies'} | {platform} | {url}")
     result = _download_ytdlp(url, output_dir, platform)
     return result if result and result != _EMPTY_RESPONSE else None

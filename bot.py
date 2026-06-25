@@ -158,84 +158,129 @@ def _download_ytdlp(url: str, output_dir: str, platform: str) -> str | None:
         return None
 
 # ──────────────────────────────────────────
-# МЕТОД 2: Threads scraper (fallback)
+# МЕТОД 2: Threads internal GraphQL API
 # ──────────────────────────────────────────
-def _download_threads_scraper(url: str, output_dir: str) -> str | None:
-    """Парсимо HTML сторінки Threads напряму — OG-теги або embedded JSON."""
+def _find_video_urls_in_json(obj: object, results: list | None = None) -> list:
+    """Рекурсивно шукаємо video URL у JSON-відповіді."""
+    if results is None:
+        results = []
+    if isinstance(obj, dict):
+        for key, val in obj.items():
+            if key in ("url", "video_url", "playback_url",
+                       "browser_native_hd_url", "browser_native_sd_url",
+                       "download_url") and isinstance(val, str):
+                if any(cdn in val for cdn in ("fbcdn.net", "cdninstagram.com")) and ".mp4" in val:
+                    results.append(val)
+            elif isinstance(val, (dict, list)):
+                _find_video_urls_in_json(val, results)
+    elif isinstance(obj, list):
+        for item in obj:
+            _find_video_urls_in_json(item, results)
+    return results
+
+
+def _download_threads_api(url: str, output_dir: str) -> str | None:
+    """Threads internal GraphQL API — не потребує зовнішніх сервісів."""
     import urllib.request
+    import urllib.parse
+    import json as _json
 
-    req = urllib.request.Request(url, headers={
-        "User-Agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    })
-
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            html = resp.read().decode("utf-8", errors="replace")
-    except Exception as e:
-        logger.error(f"Threads scraper: HTTP помилка: {e}")
+    # 1. Витягуємо shortcode з URL
+    m = re.search(r'/post/([A-Za-z0-9_-]+)', url)
+    if not m:
+        logger.warning("Threads API: не вдалось витягнути shortcode")
         return None
+    shortcode = m.group(1)
 
-    video_url = None
+    # 2. Shortcode → numeric media_id (Instagram base64 алфавіт)
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    media_id = 0
+    for c in shortcode:
+        if c in alphabet:
+            media_id = media_id * 64 + alphabet.index(c)
+    logger.info(f"Threads API: shortcode={shortcode} → media_id={media_id}")
 
-    # 1. OG video тег (server-side rendering для SEO)
-    for pattern in [
-        r'property=["\']og:video(?::url|:secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
-        r'content=["\']([^"\']+)["\'][^>]+property=["\']og:video(?::url|:secure_url)?["\']',
-    ]:
-        m = re.search(pattern, html)
-        if m:
-            video_url = m.group(1).replace("&amp;", "&")
-            logger.info("Threads scraper: знайдено через OG tag")
-            break
+    # 3. Пробуємо декілька doc_id (Meta може їх змінювати)
+    doc_id_variants = [
+        ("5587632691339264", "postID"),
+        ("9360915773983802", "mediaID"),
+    ]
 
-    # 2. Embedded JSON — типові поля Meta/Instagram
-    if not video_url:
-        for pattern in [
-            r'"video_url"\s*:\s*"(https://[^"]+)"',
-            r'"playback_url"\s*:\s*"(https://[^"]+)"',
-            r'"browser_native_hd_url"\s*:\s*"(https://[^"]+)"',
-            r'"browser_native_sd_url"\s*:\s*"(https://[^"]+)"',
-            r'(https://[^"\'\\]+fbcdn\.net/[^"\'\\]+\.mp4[^"\'\\]*)',
-            r'(https://[^"\'\\]+cdninstagram\.com/[^"\'\\]+\.mp4[^"\'\\]*)',
-        ]:
-            m = re.search(pattern, html)
-            if m:
-                video_url = m.group(1).replace("\\u0026", "&").replace("\\/", "/")
-                logger.info("Threads scraper: знайдено через JSON embed")
-                break
+    # Читаємо Instagram cookies якщо є — допомагає з авторизацією
+    cookie_header = ""
+    if _COOKIES_FILE:
+        try:
+            parts_list = []
+            with open(_COOKIES_FILE) as cf:
+                for line in cf:
+                    if line.startswith("#") or not line.strip():
+                        continue
+                    parts = line.strip().split("\t")
+                    if len(parts) >= 7 and "instagram" in parts[0]:
+                        parts_list.append(f"{parts[5]}={parts[6]}")
+            cookie_header = "; ".join(parts_list)
+        except Exception:
+            pass
 
-    if not video_url:
-        logger.warning("Threads scraper: відео URL не знайдено в HTML")
-        return None
+    for doc_id, var_key in doc_id_variants:
+        variables = _json.dumps({var_key: str(media_id)})
+        payload = urllib.parse.urlencode({
+            "variables": variables,
+            "doc_id": doc_id,
+        }).encode()
 
-    logger.info(f"Threads scraper: завантажуємо {video_url[:80]}...")
-    try:
-        vid_req = urllib.request.Request(video_url, headers={
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
-            "Referer": "https://www.threads.com/",
-        })
-        output_path = os.path.join(output_dir, "video.mp4")
-        with urllib.request.urlopen(vid_req, timeout=60) as resp, open(output_path, "wb") as f:
-            while True:
-                chunk = resp.read(65536)
-                if not chunk:
-                    break
-                f.write(chunk)
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "threads-client",
+            "x-ig-app-id": "238260118697367",
+            "Accept": "application/json",
+        }
+        if cookie_header:
+            headers["Cookie"] = cookie_header
 
-        size = os.path.getsize(output_path)
-        if size > 10000:
-            logger.info(f"Threads scraper OK: {size / 1024 / 1024:.1f}MB")
-            return output_path
-        logger.warning(f"Threads scraper: файл замалий ({size} bytes)")
-        return None
-    except Exception as e:
-        logger.error(f"Threads scraper: помилка завантаження: {e}")
-        return None
+        req = urllib.request.Request(
+            "https://www.threads.net/api/graphql",
+            data=payload,
+            method="POST",
+            headers=headers,
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = _json.loads(resp.read())
+        except Exception as e:
+            logger.warning(f"Threads API: GraphQL request failed (doc_id={doc_id}): {e}")
+            continue
+
+        video_urls = _find_video_urls_in_json(data)
+        if not video_urls:
+            logger.warning(f"Threads API: відео URL не знайдено (doc_id={doc_id})")
+            continue
+
+        # Беремо перший URL (зазвичай найкраща якість)
+        video_url = video_urls[0]
+        logger.info(f"Threads API: знайдено {len(video_urls)} відео URL(s), завантажуємо...")
+
+        # 4. Завантажуємо відео
+        try:
+            vid_req = urllib.request.Request(video_url, headers={
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+                "Referer": "https://www.threads.com/",
+            })
+            output_path = os.path.join(output_dir, "video.mp4")
+            with urllib.request.urlopen(vid_req, timeout=60) as resp, open(output_path, "wb") as f:
+                while chunk := resp.read(65536):
+                    f.write(chunk)
+
+            size = os.path.getsize(output_path)
+            if size > 10000:
+                logger.info(f"Threads API OK: {size / 1024 / 1024:.1f}MB")
+                return output_path
+            logger.warning(f"Threads API: файл замалий ({size} bytes)")
+        except Exception as e:
+            logger.error(f"Threads API: download error: {e}")
+
+    return None
 
 
 # ──────────────────────────────────────────
@@ -243,15 +288,15 @@ def _download_threads_scraper(url: str, output_dir: str) -> str | None:
 # ──────────────────────────────────────────
 def download_media(url: str, output_dir: str, platform: str) -> str | None:
     if platform == "threads":
-        # yt-dlp: спробуємо threads.net (yt-dlp не підтримує threads.com)
+        # 1. yt-dlp (threads.net — може запрацювати в майбутньому)
         ytdlp_url = url.replace("threads.com", "threads.net")
-        logger.info(f"yt-dlp: {'cookies активні' if _COOKIES_FILE else 'без cookies'} | {platform} | {ytdlp_url}")
+        logger.info(f"yt-dlp: {'cookies активні' if _COOKIES_FILE else 'без cookies'} | threads | {ytdlp_url}")
         result = _download_ytdlp(ytdlp_url, output_dir, platform)
         if result and result != _EMPTY_RESPONSE:
             return result
-        # Fallback: прямий парсинг HTML
-        logger.info("Threads: yt-dlp не впорався, спробуємо scraper")
-        return _download_threads_scraper(url, output_dir)
+        # 2. Threads internal GraphQL API
+        logger.info("Threads: yt-dlp не впорався → GraphQL API")
+        return _download_threads_api(url, output_dir)
 
     logger.info(f"yt-dlp: {'cookies активні' if _COOKIES_FILE else 'без cookies'} | {platform} | {url}")
     result = _download_ytdlp(url, output_dir, platform)

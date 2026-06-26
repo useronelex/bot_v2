@@ -54,12 +54,6 @@ FACEBOOK_PATTERNS = [
     re.compile(r'https?://(?:www\.|m\.|web\.)?facebook\.com/share/r/[\w-]+'),
 ]
 
-# ★ НОВИЙ БЛОК — Threads
-THREADS_PATTERNS = [
-    re.compile(r'https?://(?:www\.)?threads\.(?:com|net)/@[\w.]+/post/[\w-]+'),
-    re.compile(r'https?://(?:www\.)?threads\.(?:com|net)/t/[\w-]+'),
-]
-
 
 def extract_url(text: str) -> tuple[str, str] | None:
     for pattern in INSTAGRAM_PATTERNS:
@@ -70,11 +64,6 @@ def extract_url(text: str) -> tuple[str, str] | None:
         match = pattern.search(text)
         if match:
             return match.group(0).split('?')[0], "facebook"
-    # ★ НОВИЙ БЛОК — Threads
-    for pattern in THREADS_PATTERNS:
-        match = pattern.search(text)
-        if match:
-            return match.group(0).split('?')[0].rstrip('/'), "threads"
     return None
 
 # ──────────────────────────────────────────
@@ -158,185 +147,9 @@ def _download_ytdlp(url: str, output_dir: str, platform: str) -> str | None:
         return None
 
 # ──────────────────────────────────────────
-# МЕТОД 2: Threads internal GraphQL API
-# ──────────────────────────────────────────
-def _find_video_urls_in_json(obj: object, results: list | None = None) -> list:
-    """Рекурсивно шукаємо video URL у JSON-відповіді."""
-    if results is None:
-        results = []
-    if isinstance(obj, dict):
-        for key, val in obj.items():
-            if key in ("url", "video_url", "playback_url",
-                       "browser_native_hd_url", "browser_native_sd_url",
-                       "download_url") and isinstance(val, str):
-                if any(cdn in val for cdn in ("fbcdn.net", "cdninstagram.com")) and ".mp4" in val:
-                    results.append(val)
-            elif isinstance(val, (dict, list)):
-                _find_video_urls_in_json(val, results)
-    elif isinstance(obj, list):
-        for item in obj:
-            _find_video_urls_in_json(item, results)
-    return results
-
-
-def _download_threads_api(url: str, output_dir: str) -> str | None:
-    """Threads internal GraphQL API — не потребує зовнішніх сервісів."""
-    import urllib.request
-    import json as _json
-
-    # 1. Витягуємо shortcode з URL
-    m = re.search(r'/post/([A-Za-z0-9_-]+)', url)
-    if not m:
-        logger.warning("Threads API: не вдалось витягнути shortcode")
-        return None
-    shortcode = m.group(1)
-
-    # 2. Shortcode → numeric media_id (Instagram base64 алфавіт)
-    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-    media_id = 0
-    for c in shortcode:
-        if c in alphabet:
-            media_id = media_id * 64 + alphabet.index(c)
-    logger.info(f"Threads API: shortcode={shortcode} → media_id={media_id}")
-
-    # 3. Читаємо Instagram cookies (Threads і Instagram — один бекенд Meta)
-    cookie_header = ""
-    if _COOKIES_FILE:
-        try:
-            parts_list = []
-            with open(_COOKIES_FILE) as cf:
-                for line in cf:
-                    if line.startswith("#") or not line.strip():
-                        continue
-                    parts = line.strip().split("\t")
-                    if len(parts) >= 7:
-                        parts_list.append(f"{parts[5]}={parts[6]}")
-            cookie_header = "; ".join(parts_list)
-        except Exception:
-            pass
-
-    if not cookie_header:
-        logger.warning("Threads API: Instagram cookies відсутні — неможливо продовжити")
-        return None
-
-    # 4. Instagram private API — стабільний роками, без doc_id, той самий бекенд
-    ig_mobile_ua = (
-        "Instagram 339.0.0.0.2 Android (31/12; 560dpi; 1440x3040; "
-        "samsung; SM-G998B; p3s; qcom; en_US; 572566893)"
-    )
-    req = urllib.request.Request(
-        f"https://i.instagram.com/api/v1/media/{media_id}/info/",
-        headers={
-            "User-Agent": ig_mobile_ua,
-            "X-IG-App-ID": "936619743392459",
-            "Cookie": cookie_header,
-            "Accept": "*/*",
-            "Accept-Language": "en-US",
-        }
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = _json.loads(resp.read())
-    except Exception as e:
-        logger.warning(f"Threads API: media/info request failed: {e}")
-        return None
-
-    # 5. Шукаємо відео URL (video_versions — від найкращої до гіршої якості)
-    video_urls = _find_video_urls_in_json(data)
-    if not video_urls:
-        logger.warning("Threads API: відео URL не знайдено у відповіді")
-        return None
-
-    video_url = video_urls[0]
-    logger.info(f"Threads API: знайдено {len(video_urls)} URL(s), завантажуємо...")
-
-    # 6. Завантажуємо відео
-    try:
-        vid_req = urllib.request.Request(video_url, headers={
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
-            "Referer": "https://www.threads.com/",
-        })
-        output_path = os.path.join(output_dir, "video.mp4")
-        with urllib.request.urlopen(vid_req, timeout=60) as resp, open(output_path, "wb") as f:
-            while chunk := resp.read(65536):
-                f.write(chunk)
-
-        size = os.path.getsize(output_path)
-        if size > 10000:
-            logger.info(f"Threads API OK: {size / 1024 / 1024:.1f}MB")
-            return output_path
-        logger.warning(f"Threads API: файл замалий ({size} bytes)")
-    except Exception as e:
-        logger.error(f"Threads API: download error: {e}")
-
-    return None
-
-
-# ──────────────────────────────────────────
-# МЕТОД 3: gallery-dl (Threads fallback)
-# ──────────────────────────────────────────
-def _download_gallery_dl(url: str, output_dir: str) -> str | None:
-    """gallery-dl — підтримує Threads нативно, активно оновлюється."""
-    import subprocess
-    import shutil
-
-    cmd = [
-        "gallery-dl",
-        "--directory", output_dir,
-    ]
-    if _COOKIES_FILE:
-        cmd += ["--cookies", _COOKIES_FILE]
-    cmd.append(url.replace("threads.com", "threads.net"))
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
-        logger.info(f"gallery-dl exit={result.returncode} | {result.stdout[:200]} {result.stderr[:200]}")
-    except FileNotFoundError:
-        logger.error("gallery-dl: не встановлено — додай до requirements.txt")
-        return None
-    except subprocess.TimeoutExpired:
-        logger.error("gallery-dl: timeout")
-        return None
-    except Exception as e:
-        logger.error(f"gallery-dl: {e}")
-        return None
-
-    # Шукаємо відео файл у будь-якому підкаталозі
-    for ext in ("mp4", "mov", "webm", "mkv", "m4v"):
-        for f in sorted(Path(output_dir).rglob(f"*.{ext}")):
-            if f.stat().st_size > 10000:
-                dest = Path(output_dir) / "video.mp4"
-                if f != dest:
-                    shutil.copy2(f, dest)
-                size_mb = dest.stat().st_size / 1024 / 1024
-                logger.info(f"gallery-dl OK: {f.name} → {size_mb:.1f}MB")
-                return str(dest)
-
-    logger.warning("gallery-dl: відео файл не знайдено після завантаження")
-    return None
-
-
-# ──────────────────────────────────────────
 # DISPATCH
 # ──────────────────────────────────────────
 def download_media(url: str, output_dir: str, platform: str) -> str | None:
-    if platform == "threads":
-        # 1. yt-dlp (threads.net — може запрацювати в майбутньому)
-        ytdlp_url = url.replace("threads.com", "threads.net")
-        logger.info(f"yt-dlp: {'cookies активні' if _COOKIES_FILE else 'без cookies'} | threads | {ytdlp_url}")
-        result = _download_ytdlp(ytdlp_url, output_dir, platform)
-        if result and result != _EMPTY_RESPONSE:
-            return result
-        # 2. Instagram private API (Threads і Instagram — один бекенд)
-        logger.info("Threads: yt-dlp не впорався → Instagram private API")
-        result = _download_threads_api(url, output_dir)
-        if result:
-            return result
-        # 3. gallery-dl — підтримує Threads нативно
-        logger.info("Threads: Instagram API не впорався → gallery-dl")
-        return _download_gallery_dl(url, output_dir)
-
     logger.info(f"yt-dlp: {'cookies активні' if _COOKIES_FILE else 'без cookies'} | {platform} | {url}")
     result = _download_ytdlp(url, output_dir, platform)
     return result if result and result != _EMPTY_RESPONSE else None
@@ -545,7 +358,7 @@ def create_application() -> Application:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CommandHandler("clean", cmd_clean))
     app.add_handler(CommandHandler("chats", cmd_chats))
-    logger.info("Бот запущено | yt-dlp (Instagram, Facebook Reels, Threads)")
+    logger.info("Бот запущено | yt-dlp (Instagram, Facebook Reels)")
     logger.info(f"Cookies: {'OK' if _COOKIES_FILE else 'НЕ ВСТАНОВЛЕНО'}")
     logger.info(f"Admin: {ADMIN_USER_ID or 'не встановлено'}")
     return app

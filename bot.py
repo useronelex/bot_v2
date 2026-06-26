@@ -1,4 +1,3 @@
-
 import os
 import re
 import logging
@@ -288,7 +287,7 @@ def _download_gallery_dl(url: str, output_dir: str) -> str | None:
     ]
     if _COOKIES_FILE:
         cmd += ["--cookies", _COOKIES_FILE]
-    cmd.append(url)
+    cmd.append(url.replace("threads.com", "threads.net"))
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)

@@ -1,3 +1,4 @@
+
 import os
 import re
 import logging
@@ -284,8 +285,6 @@ def _download_gallery_dl(url: str, output_dir: str) -> str | None:
     cmd = [
         "gallery-dl",
         "--directory", output_dir,
-        "--no-config",
-        "--no-skip",
     ]
     if _COOKIES_FILE:
         cmd += ["--cookies", _COOKIES_FILE]

@@ -274,6 +274,52 @@ def _download_threads_api(url: str, output_dir: str) -> str | None:
 
 
 # ──────────────────────────────────────────
+# МЕТОД 3: gallery-dl (Threads fallback)
+# ──────────────────────────────────────────
+def _download_gallery_dl(url: str, output_dir: str) -> str | None:
+    """gallery-dl — підтримує Threads нативно, активно оновлюється."""
+    import subprocess
+    import shutil
+
+    cmd = [
+        "gallery-dl",
+        "--directory", output_dir,
+        "--no-config",
+        "--no-skip",
+    ]
+    if _COOKIES_FILE:
+        cmd += ["--cookies", _COOKIES_FILE]
+    cmd.append(url)
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        logger.info(f"gallery-dl exit={result.returncode} | {result.stdout[:200]} {result.stderr[:200]}")
+    except FileNotFoundError:
+        logger.error("gallery-dl: не встановлено — додай до requirements.txt")
+        return None
+    except subprocess.TimeoutExpired:
+        logger.error("gallery-dl: timeout")
+        return None
+    except Exception as e:
+        logger.error(f"gallery-dl: {e}")
+        return None
+
+    # Шукаємо відео файл у будь-якому підкаталозі
+    for ext in ("mp4", "mov", "webm", "mkv", "m4v"):
+        for f in sorted(Path(output_dir).rglob(f"*.{ext}")):
+            if f.stat().st_size > 10000:
+                dest = Path(output_dir) / "video.mp4"
+                if f != dest:
+                    shutil.copy2(f, dest)
+                size_mb = dest.stat().st_size / 1024 / 1024
+                logger.info(f"gallery-dl OK: {f.name} → {size_mb:.1f}MB")
+                return str(dest)
+
+    logger.warning("gallery-dl: відео файл не знайдено після завантаження")
+    return None
+
+
+# ──────────────────────────────────────────
 # DISPATCH
 # ──────────────────────────────────────────
 def download_media(url: str, output_dir: str, platform: str) -> str | None:
@@ -286,7 +332,12 @@ def download_media(url: str, output_dir: str, platform: str) -> str | None:
             return result
         # 2. Instagram private API (Threads і Instagram — один бекенд)
         logger.info("Threads: yt-dlp не впорався → Instagram private API")
-        return _download_threads_api(url, output_dir)
+        result = _download_threads_api(url, output_dir)
+        if result:
+            return result
+        # 3. gallery-dl — підтримує Threads нативно
+        logger.info("Threads: Instagram API не впорався → gallery-dl")
+        return _download_gallery_dl(url, output_dir)
 
     logger.info(f"yt-dlp: {'cookies активні' if _COOKIES_FILE else 'без cookies'} | {platform} | {url}")
     result = _download_ytdlp(url, output_dir, platform)

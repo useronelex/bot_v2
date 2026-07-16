@@ -84,15 +84,18 @@ def _init_cookies() -> None:
 # ──────────────────────────────────────────
 # МЕТОД 1: yt-dlp
 # ──────────────────────────────────────────
-_EMPTY_RESPONSE = "EMPTY_RESPONSE"
 
 def _download_ytdlp(url: str, output_dir: str, platform: str) -> str | None:
     import yt_dlp
     fmt = (
+        # H.264 + AAC — оптимально для Telegram
         "bestvideo[vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]/"
         "bestvideo[vcodec^=avc]+bestaudio/"
-        "best[ext=mp4]/"
+        # Будь-яке відео + аудіо (ffmpeg сконвертує)
+        "bestvideo+bestaudio/"
+        # Фінальний fallback — combined stream (завжди має аудіо)
         "best"
+        # best[ext=mp4] свідомо прибрано: може бути video-only DASH стрім
     )
     ydl_opts = {
         "outtmpl": os.path.join(output_dir, "video.%(ext)s"),
@@ -104,6 +107,11 @@ def _download_ytdlp(url: str, output_dir: str, platform: str) -> str | None:
         "socket_timeout": 30,
         "retries": 3,
         "fragment_retries": 3,
+        # Паралельне завантаження фрагментів DASH — швидше для Instagram/Facebook
+        "concurrent_fragment_downloads": 4,
+        # Якщо швидкість впала нижче 50 KB/s — вважаємо throttling і повторюємо
+        "throttledratelimit": 50000,
+        "prefer_ffmpeg": True,
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -112,7 +120,11 @@ def _download_ytdlp(url: str, output_dir: str, platform: str) -> str | None:
             ),
         },
         "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}],
-        "postprocessor_args": {"ffmpegvideoconvertor": ["-movflags", "+faststart"]},
+        "postprocessor_args": {
+            # -movflags +faststart: метадані на початок файлу → миттєвий стрімінг
+            "ffmpegmerger": ["-movflags", "+faststart"],
+            "ffmpegvideoconvertor": ["-movflags", "+faststart"],
+        },
     }
     if _COOKIES_FILE:
         ydl_opts["cookiefile"] = _COOKIES_FILE
@@ -129,8 +141,8 @@ def _download_ytdlp(url: str, output_dir: str, platform: str) -> str | None:
     except yt_dlp.utils.DownloadError as e:
         err = str(e).lower()
         if "empty media response" in err:
-            logger.warning("yt-dlp: empty media response — спробуємо Cobalt")
-            return _EMPTY_RESPONSE
+            logger.warning("yt-dlp: empty media response")
+            return None
         if "private" in err or "login" in err or "age" in err or "rate-limit" in err:
             logger.warning(f"yt-dlp: авторизація/ліміт — {str(e)[:120]}")
         elif "not found" in err or "404" in err:
@@ -151,8 +163,7 @@ def _download_ytdlp(url: str, output_dir: str, platform: str) -> str | None:
 # ──────────────────────────────────────────
 def download_media(url: str, output_dir: str, platform: str) -> str | None:
     logger.info(f"yt-dlp: {'cookies активні' if _COOKIES_FILE else 'без cookies'} | {platform} | {url}")
-    result = _download_ytdlp(url, output_dir, platform)
-    return result if result and result != _EMPTY_RESPONSE else None
+    return _download_ytdlp(url, output_dir, platform)
 
 # ──────────────────────────────────────────
 # RATE LIMIT
@@ -247,17 +258,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     pass
                 return
 
-            width = height = None
+            width = height = duration = None
             try:
                 import subprocess, json as _json
                 probe = subprocess.run(
                     ["ffprobe", "-v", "error", "-select_streams", "v:0",
-                     "-show_entries", "stream=width,height", "-of", "json", media_path],
+                     "-show_entries", "stream=width,height:format=duration",
+                     "-of", "json", media_path],
                     capture_output=True, text=True, timeout=10
                 )
-                stream = _json.loads(probe.stdout).get("streams", [{}])[0]
+                probe_data = _json.loads(probe.stdout)
+                stream = probe_data.get("streams", [{}])[0]
                 width = stream.get("width")
                 height = stream.get("height")
+                raw_dur = probe_data.get("format", {}).get("duration")
+                duration = int(float(raw_dur)) if raw_dur else None
             except Exception:
                 pass
 
@@ -271,6 +286,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                             supports_streaming=True,
                             width=width,
                             height=height,
+                            duration=duration,
                             write_timeout=120,
                             read_timeout=60,
                             connect_timeout=30,

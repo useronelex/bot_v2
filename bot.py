@@ -90,12 +90,14 @@ def _download_ytdlp(url: str, output_dir: str, platform: str) -> str | None:
     fmt = (
         # H.264 + AAC — оптимально для Telegram
         "bestvideo[vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]/"
+        # Явно вимагаємо AAC аудіо (оригінальний трек, не замінений)
+        "bestvideo[vcodec^=avc]+bestaudio[acodec^=mp4a]/"
         "bestvideo[vcodec^=avc]+bestaudio/"
-        # Будь-яке відео + аудіо (ffmpeg сконвертує)
         "bestvideo+bestaudio/"
-        # Фінальний fallback — combined stream (завжди має аудіо)
+        # Pre-muxed MP4 з аудіо — часто містить оригінальну музику
+        # [acodec!=none] виключає video-only DASH стріми
+        "best[ext=mp4][acodec!=none]/"
         "best"
-        # best[ext=mp4] свідомо прибрано: може бути video-only DASH стрім
     )
     ydl_opts = {
         "outtmpl": os.path.join(output_dir, "video.%(ext)s"),
@@ -273,8 +275,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 height = stream.get("height")
                 raw_dur = probe_data.get("format", {}).get("duration")
                 duration = int(float(raw_dur)) if raw_dur else None
+                # Перевірка наявності аудіо потоку
+                audio_probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-select_streams", "a:0",
+                     "-show_entries", "stream=codec_name",
+                     "-of", "json", media_path],
+                    capture_output=True, text=True, timeout=10
+                )
+                has_audio = bool(_json.loads(audio_probe.stdout).get("streams"))
+                if not has_audio:
+                    logger.warning("⚠️ Відео без аудіо потоку — можливо Meta заблокувала трек")
             except Exception:
-                pass
+                has_audio = True  # не заважаємо відправці якщо ffprobe впав
 
             sent = False
             for attempt in range(3):

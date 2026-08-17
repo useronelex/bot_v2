@@ -106,6 +106,7 @@ def _download_ytdlp(url: str, output_dir: str, platform: str) -> str | None:
         "bestvideo[vcodec!=unknown]+bestaudio[ext=m4a]/"
         "bestvideo[vcodec!=unknown]+bestaudio/"
         "best[acodec!=none]"
+        "best"
     )
     
     ydl_opts = {
@@ -166,12 +167,15 @@ def _download_ytdlp(url: str, output_dir: str, platform: str) -> str | None:
             logger.info("yt-dlp: фото пост")
         elif "can't be seen" in err or "isn't available" in err or "certain audiences" in err:
             logger.warning("yt-dlp: контент обмежено (18+/гео)")
+        elif "requested format is not available" in err:
+            logger.warning("yt-dlp: формат недоступний — відео без аудіо з цього IP")
         else:
             logger.error(f"yt-dlp: {str(e)[:200]}")
         return None
     except Exception as e:
         logger.error(f"yt-dlp Exception: {e}", exc_info=True)
         return None
+        
 
 # ──────────────────────────────────────────
 # DISPATCH

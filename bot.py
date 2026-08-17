@@ -103,18 +103,16 @@ def _download_ytdlp(url: str, output_dir: str, platform: str) -> str | None:
     )
     '''
     fmt = (
-        # H264 + аудіо (пріоритет для iOS сумісності)
-        "bestvideo[vcodec^=avc]+bestaudio/"
-        # VP9 + аудіо (якщо H264 недоступний)
-        "bestvideo[vcodec^=vp]+bestaudio/"
-        # будь-яке відео + аудіо
-        "bestvideo+bestaudio/"
-        # pre-muxed з аудіо
+        "bestvideo[vcodec^=avc][vcodec!=unknown]+bestaudio/"
+        "bestvideo[vcodec^=vp][vcodec!=unknown]+bestaudio/"
+        "bestvideo[vcodec!=unknown]+bestaudio/"
         "best[acodec!=none]/"
-        "best"
+        "best"    
     )
     
     ydl_opts = {
+        "format_sort": ["vcodec:avc", "vcodec:vp9", "+acodec"],
+        "ignore_no_formats_error": False,
         "outtmpl": os.path.join(output_dir, "video.%(ext)s"),
         "format": fmt,
         "merge_output_format": "mp4",

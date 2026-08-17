@@ -103,11 +103,10 @@ def _download_ytdlp(url: str, output_dir: str, platform: str) -> str | None:
     )
     '''
     fmt = (
-        "bestvideo[vcodec^=avc][vcodec!=unknown]+bestaudio/"
-        "bestvideo[vcodec^=vp][vcodec!=unknown]+bestaudio/"
-        "bestvideo[vcodec!=unknown]+bestaudio/"
-        "best[acodec!=none]/"
-        "best"    
+        "bestvideo[vcodec^=avc]+bestaudio/"
+        "bestvideo[vcodec^=vp09]+bestaudio[ext=m4a]/"
+        "bestvideo+bestaudio/"
+        "best"
     )
     
     ydl_opts = {
@@ -116,8 +115,8 @@ def _download_ytdlp(url: str, output_dir: str, platform: str) -> str | None:
         "outtmpl": os.path.join(output_dir, "video.%(ext)s"),
         "format": fmt,
         "merge_output_format": "mp4",
-        "verbose": True,
-        "quiet": False,
+        #"verbose": True,
+        "quiet": True,
         "no_warnings": True,
         "noprogress": True,
         "socket_timeout": 30,

@@ -87,6 +87,8 @@ def _init_cookies() -> None:
 
 def _download_ytdlp(url: str, output_dir: str, platform: str) -> str | None:
     import yt_dlp
+    ''' 
+    #Попередній формат
     fmt = (
         # H.264 + AAC — оптимально для Telegram
         "bestvideo[vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]/"
@@ -99,6 +101,19 @@ def _download_ytdlp(url: str, output_dir: str, platform: str) -> str | None:
         "best[ext=mp4][acodec!=none]/"
         "best"
     )
+    '''
+    fmt = (
+        # H264 + аудіо (пріоритет для iOS сумісності)
+        "bestvideo[vcodec^=avc]+bestaudio/"
+        # VP9 + аудіо (якщо H264 недоступний)
+        "bestvideo[vcodec^=vp]+bestaudio/"
+        # будь-яке відео + аудіо
+        "bestvideo+bestaudio/"
+        # pre-muxed з аудіо
+        "best[acodec!=none]/"
+        "best"
+    )
+    
     ydl_opts = {
         "outtmpl": os.path.join(output_dir, "video.%(ext)s"),
         "format": fmt,

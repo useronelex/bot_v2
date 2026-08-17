@@ -103,14 +103,14 @@ def _download_ytdlp(url: str, output_dir: str, platform: str) -> str | None:
     )
     '''
     fmt = (
-        "bestvideo[vcodec^=avc]+bestaudio/"
-        "bestvideo[vcodec^=vp09]+bestaudio[ext=m4a]/"
-        "bestvideo+bestaudio/"
-        "best"
+        "bestvideo[vcodec!=unknown]+bestaudio[ext=m4a]/"
+        "bestvideo[vcodec!=unknown]+bestaudio/"
+        "best[acodec!=none]"
     )
     
     ydl_opts = {
-        "format_sort": ["vcodec:avc", "vcodec:vp9", "+acodec"],
+       "format_sort_force": True,
+        "format_sort": ["+acodec", "vcodec:vp9", "vcodec:avc"],
         "ignore_no_formats_error": False,
         "outtmpl": os.path.join(output_dir, "video.%(ext)s"),
         "format": fmt,

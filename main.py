@@ -4,6 +4,7 @@ import asyncio
 from threading import Thread
 from flask import Flask, request
 from telegram import Update
+from telegram.ext import CommandHandler
 from bot import create_application, BOT_TOKEN, WEBHOOK_URL
 import powercut  # ← НОВЕ: незалежний моніторинг відключень
 
@@ -15,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 telegram_app = create_application()
+telegram_app.add_handler(CommandHandler("graph", powercut.cmd_graph))  # ← НОВЕ: /graph (адмін)
 loop = None
 
 

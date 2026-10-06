@@ -27,7 +27,7 @@ logger = logging.getLogger("powercut")
 # CONFIG
 # ──────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-CHAT_ID = int(os.environ.get("POWERCUT_CHAT_ID") 
+CHAT_ID = int(os.environ.get("POWERCUT_CHAT_ID") or "-1002257349628")
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID") or "0")
 CHANNEL = os.environ.get("POWERCUT_CHANNEL", "pat_cherkasyoblenergo")
 QUEUES = tuple(q.strip() for q in os.environ.get("POWERCUT_QUEUES", "1.1,2.1,3.1").split(",") if q.strip())
@@ -150,8 +150,8 @@ def _fmt_date(d: date) -> str:
     return f"{d.day} {MONTH_NAMES[d.month]}"
 
 
-def fmt_new(d: date, queues: dict) -> str:
-    lines = [f"⚡ Графік відключень на {_fmt_date(d)}", ""]
+def fmt_new(d: date, queues: dict, title: str = "⚡ Графік відключень на") -> str:
+    lines = [f"{title} {_fmt_date(d)}", ""]
     lines += [f"{q}: {_fmt(queues[q])}" for q in QUEUES if q in queues]
     return "\n".join(lines)
 
@@ -273,6 +273,44 @@ async def _process(bot: Bot, texts: list[str], state: dict, today: date) -> None
         dirty = True
     if dirty:
         _save_state(state)
+
+
+# ──────────────────────────────────────────
+# КОМАНДА /graph (тільки адмін)
+# ──────────────────────────────────────────
+async def current_schedules_text() -> str:
+    """Свіжі графіки з каналу (на сьогодні й далі) одним текстом."""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                             "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+    async with httpx.AsyncClient(headers=headers, timeout=15, follow_redirects=True) as client:
+        texts = await _fetch_texts(client)
+    today = _now_kyiv().date()
+    current = {d: q for d, q in build_current(texts, today).items() if d >= today}
+    if not current:
+        return "Актуальних графіків для черг " + ", ".join(QUEUES) + " у каналі не знайдено."
+    return "\n\n".join(fmt_new(d, q, "📋 Поточний графік на") for d, q in sorted(current.items()))
+
+
+async def cmd_graph(update, context) -> None:
+    """/graph — надіслати поточні графіки в групу POWERCUT_CHAT_ID. Лише для ADMIN_USER_ID."""
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user or not ADMIN_USER_ID or user.id != ADMIN_USER_ID:
+        return
+    try:
+        text = await current_schedules_text()
+        await context.bot.send_message(chat_id=CHAT_ID, text=text)
+    except Exception as e:
+        logger.error(f"/graph: {e}")
+        await msg.reply_text(f"Не вдалося отримати графік: {e}")
+        return
+    if msg.chat_id == CHAT_ID:
+        try:
+            await msg.delete()  # прибираємо саму команду з групи
+        except Exception:
+            pass
+    else:
+        await msg.reply_text("Надіслано в групу ✅")
 
 
 # ──────────────────────────────────────────

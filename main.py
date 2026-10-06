@@ -1,7 +1,3 @@
-"""
-Entry point for Render.com deployment with webhook support.
-"""
-
 import os
 import logging
 import asyncio
@@ -9,6 +5,7 @@ from threading import Thread
 from flask import Flask, request
 from telegram import Update
 from bot import create_application, BOT_TOKEN, WEBHOOK_URL
+import powercut  # ← НОВЕ: незалежний моніторинг відключень
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -44,7 +41,11 @@ def home():
 
 @app.route("/health")
 def health():
-    return {"status": "ok", "bot_configured": bool(BOT_TOKEN and WEBHOOK_URL)}, 200
+    return {
+        "status": "ok",
+        "bot_configured": bool(BOT_TOKEN and WEBHOOK_URL),
+        "powercut": powercut.status(),  # ← НОВЕ
+    }, 200
 
 
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
@@ -134,6 +135,9 @@ if __name__ == "__main__":
 
     if not WEBHOOK_URL:
         logger.warning("WEBHOOK_URL not set!")
+
+    # ← НОВЕ: свій потік, свій event loop, свій Bot. Стартує ПЕРШИМ і не залежить від решти.
+    powercut.start_in_background()
 
     logger.info("Starting background event loop...")
     loop_thread = Thread(target=start_event_loop, daemon=True)

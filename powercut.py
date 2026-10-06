@@ -27,7 +27,7 @@ logger = logging.getLogger("powercut")
 # CONFIG
 # ──────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-CHAT_ID = int(os.environ.get("POWERCUT_CHAT_ID") or "-1002257349628")
+CHAT_ID = int(os.environ.get("POWERCUT_CHAT_ID"))
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID") or "0")
 CHANNEL = os.environ.get("POWERCUT_CHANNEL", "pat_cherkasyoblenergo")
 QUEUES = tuple(q.strip() for q in os.environ.get("POWERCUT_QUEUES", "1.1,2.1,3.1").split(",") if q.strip())

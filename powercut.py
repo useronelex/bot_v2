@@ -1,9 +1,6 @@
 """
 powercut.py — незалежний моніторинг графіків відключень світла.
 
-Читає публічну веб-версію Telegram-каналу (https://t.me/s/<канал>), витягує графіки
-для заданих черг і надсилає в чат повідомлення ЛИШЕ коли графік з'явився або змінився.
-
 """
 
 import asyncio
@@ -57,6 +54,12 @@ _INTERVAL = re.compile(r"(\d{1,2}):(\d{2})\s*(?:[-–—]|до)\s*(\d{1,2}):(\d{
 
 # статус для /health
 _status = {"started": None, "last_ok": None, "last_error": None, "restarts": 0}
+
+# кеш останньої успішної вичитки каналу (використовує /graph, щоб не ходити в t.me зайвий раз)
+_cache: dict = {"texts": None, "ts": 0.0}
+CACHE_MAX_AGE = 120        # сек: старіший кеш не використовуємо
+GRAPH_COOLDOWN = 10        # сек: мінімальна пауза між відповідями /graph в одному чаті
+_last_graph: dict[int, float] = {}
 
 
 class _RateLimited(Exception):
@@ -282,11 +285,13 @@ async def _process(bot: Bot, texts: list[str], state: dict, today: date) -> None
 # КОМАНДА /graph (тільки адмін)
 # ──────────────────────────────────────────
 async def current_schedules_text() -> str:
-    """Свіжі графіки з каналу (на сьогодні й далі) одним текстом."""
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                             "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
-    async with httpx.AsyncClient(headers=headers, timeout=15, follow_redirects=True) as client:
-        texts = await _fetch_texts(client)
+    """Поточні графіки (на сьогодні й далі) одним текстом. Бере кеш парсера або свіжу вичитку."""
+    texts = _cache["texts"] if time.time() - _cache["ts"] <= CACHE_MAX_AGE else None
+    if texts is None:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                 "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+        async with httpx.AsyncClient(headers=headers, timeout=15, follow_redirects=True) as client:
+            texts = await _fetch_texts(client)
     today = _now_kyiv().date()
     current = {d: q for d, q in build_current(texts, today).items() if d >= today}
     if not current:
@@ -295,25 +300,21 @@ async def current_schedules_text() -> str:
 
 
 async def cmd_graph(update, context) -> None:
-    """/graph — надіслати поточні графіки в групу POWERCUT_CHAT_ID. Лише для ADMIN_USER_ID."""
+    """/graph — доступна всім; відповідь надходить у той самий чат, де написали команду."""
     msg = update.effective_message
-    user = update.effective_user
-    if not msg or not user or not ADMIN_USER_ID or user.id != ADMIN_USER_ID:
+    if not msg:
         return
+    now = time.time()
+    if now - _last_graph.get(msg.chat_id, 0) < GRAPH_COOLDOWN:
+        return  # захист від спаму: мовчки ігноруємо
+    _last_graph[msg.chat_id] = now
     try:
         text = await current_schedules_text()
-        await context.bot.send_message(chat_id=CHAT_ID, text=text)
     except Exception as e:
         logger.error(f"/graph: {e}")
-        await msg.reply_text(f"Не вдалося отримати графік: {e}")
+        await msg.reply_text("Не вдалося отримати графік, спробуйте за хвилину.")
         return
-    if msg.chat_id == CHAT_ID:
-        try:
-            await msg.delete()  # прибираємо саму команду з групи
-        except Exception:
-            pass
-    else:
-        await msg.reply_text("Надіслано в групу ✅")
+    await msg.reply_text(text)
 
 
 # ──────────────────────────────────────────
@@ -337,6 +338,7 @@ async def _monitor(bot: Bot) -> None:
             delay = POLL_INTERVAL * random.uniform(0.8, 1.2)
             try:
                 texts = await _fetch_texts(client)
+                _cache["texts"], _cache["ts"] = texts, time.time()
                 if fails:
                     logger.info(f"Канал знову доступний після {fails} помилок")
                 fails, fail_since = 0, None

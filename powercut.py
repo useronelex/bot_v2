@@ -116,7 +116,10 @@ def parse_message(text: str, today: date) -> tuple[date, dict[str, list[list[int
         for h1, m1, h2, m2 in _INTERVAL.findall(m.group(2)):
             h1, m1, h2, m2 = int(h1), int(m1), int(h2), int(m2)
             if h1 <= 24 and h2 <= 24 and m1 < 60 and m2 < 60:
-                pairs.append([h1 * 60 + m1, h2 * 60 + m2])
+                start, end = h1 * 60 + m1, h2 * 60 + m2
+                if end == 0 and start > 0:  # "23:00 - 00:00" → кінець о півночі
+                    end = 1440
+                pairs.append([start, end])
         if pairs:
             queues.setdefault(m.group(1), []).extend(pairs)
     queues = {q: _normalize(p) for q, p in queues.items()}

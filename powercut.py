@@ -11,6 +11,7 @@ import random
 import re
 import threading
 import time
+from collections import defaultdict, deque
 from datetime import date, datetime, timedelta, timezone
 
 import httpx
@@ -60,6 +61,20 @@ _cache: dict = {"texts": None, "ts": 0.0}
 CACHE_MAX_AGE = 120        # сек: старіший кеш не використовуємо
 GRAPH_COOLDOWN = 10        # сек: мінімальна пауза між відповідями /graph в одному чаті
 _last_graph: dict[int, float] = {}
+
+# облік повідомлень, які надіслав цей модуль (для /del); bot.py веде свій — додається через add_registry()
+_sent: dict[int, deque] = defaultdict(lambda: deque(maxlen=200))
+_extra_registries: list = []
+
+
+def _record(chat_id: int, message_id: int) -> None:
+    _sent[chat_id].append(message_id)
+
+
+def add_registry(registry: dict) -> None:
+    """Підключити чужий облік повідомлень бота ({chat_id: deque[message_id]}), напр. bot._sent_messages."""
+    if registry not in _extra_registries:
+        _extra_registries.append(registry)
 
 
 class _RateLimited(Exception):
@@ -225,7 +240,8 @@ async def _fetch_texts(client: httpx.AsyncClient) -> list[str]:
 async def _send(bot: Bot, chat_id: int, text: str) -> bool:
     for _ in range(3):
         try:
-            await bot.send_message(chat_id=chat_id, text=text)
+            sent = await bot.send_message(chat_id=chat_id, text=text)
+            _record(chat_id, sent.message_id)
             return True
         except RetryAfter as e:
             ra = e.retry_after
@@ -299,22 +315,75 @@ async def current_schedules_text() -> str:
     return "\n\n".join(fmt_new(d, q, "📋 Поточний графік на") for d, q in sorted(current.items()))
 
 
+async def _delete_quietly(msg) -> None:
+    try:
+        await msg.delete()
+    except Exception:
+        pass  # немає права видаляти або повідомлення вже зникло
+
+
+async def _notice(bot, chat_id: int, text: str, ttl: int = 5) -> None:
+    """Коротке службове повідомлення, яке саме зникає."""
+    try:
+        m = await bot.send_message(chat_id=chat_id, text=text)
+        await asyncio.sleep(ttl)
+        await bot.delete_message(chat_id=chat_id, message_id=m.message_id)
+    except Exception:
+        pass
+
+
 async def cmd_graph(update, context) -> None:
-    """/graph — доступна всім; відповідь надходить у той самий чат, де написали команду."""
+    """/graph — доступна всім. Команду користувача видаляємо, графік надсилаємо в той самий чат."""
     msg = update.effective_message
     if not msg:
         return
+    chat_id = msg.chat_id
+    await _delete_quietly(msg)
+
     now = time.time()
-    if now - _last_graph.get(msg.chat_id, 0) < GRAPH_COOLDOWN:
+    if now - _last_graph.get(chat_id, 0) < GRAPH_COOLDOWN:
         return  # захист від спаму: мовчки ігноруємо
-    _last_graph[msg.chat_id] = now
+    _last_graph[chat_id] = now
     try:
         text = await current_schedules_text()
     except Exception as e:
         logger.error(f"/graph: {e}")
-        await msg.reply_text("Не вдалося отримати графік, спробуйте за хвилину.")
+        await _notice(context.bot, chat_id, "Не вдалося отримати графік, спробуйте за хвилину.")
         return
-    await msg.reply_text(text)
+    sent = await context.bot.send_message(chat_id=chat_id, text=text)
+    _record(chat_id, sent.message_id)
+
+
+async def cmd_del(update, context) -> None:
+    """/del — видалити останнє повідомлення бота в цьому чаті (графік, сповіщення, відео). Доступна всім."""
+    msg = update.effective_message
+    if not msg:
+        return
+    chat_id = msg.chat_id
+    await _delete_quietly(msg)
+
+    registries = [_sent, *_extra_registries]
+    for _ in range(5):
+        best = None  # (message_id, registry)
+        for reg in registries:
+            dq = reg.get(chat_id)
+            if dq:
+                mid = max(dq)
+                if best is None or mid > best[0]:
+                    best = (mid, reg)
+        if best is None:
+            break
+        mid, reg = best
+        try:
+            reg[chat_id].remove(mid)
+        except ValueError:
+            pass
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+            return
+        except Exception as e:  # вже видалено вручну / надто старе — пробуємо попереднє
+            logger.warning(f"/del: не вдалося видалити {mid}: {e}")
+    await _notice(context.bot, chat_id, "Немає повідомлень бота для видалення.")
 
 
 # ──────────────────────────────────────────

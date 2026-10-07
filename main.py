@@ -1,3 +1,7 @@
+"""
+Entry point for Render.com deployment with webhook support.
+"""
+
 import os
 import logging
 import asyncio
@@ -5,21 +9,22 @@ from threading import Thread
 from flask import Flask, request
 from telegram import Update
 from telegram.ext import CommandHandler
-from bot import create_application, BOT_TOKEN, WEBHOOK_URL
-import powercut  
+from bot import create_application, BOT_TOKEN, WEBHOOK_URL, _sent_messages
+import powercut  # ← НОВЕ: незалежний моніторинг відключень
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
+logger = logging.getLogger(__name__)
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-logger = logging.getLogger(__name__)
-
 app = Flask(__name__)
 telegram_app = create_application()
-telegram_app.add_handler(CommandHandler("graph", powercut.cmd_graph))  # ← НОВЕ: /graph (адмін)
+telegram_app.add_handler(CommandHandler("graph", powercut.cmd_graph))  # ← НОВЕ: /graph (для всіх)
+telegram_app.add_handler(CommandHandler("del", powercut.cmd_del))      # ← НОВЕ: /del (видалити останнє повідомлення бота)
+powercut.add_registry(_sent_messages)                                  # ← НОВЕ: /del бачить і відео з bot.py
 loop = None
 
 
@@ -141,6 +146,7 @@ if __name__ == "__main__":
     if not WEBHOOK_URL:
         logger.warning("WEBHOOK_URL not set!")
 
+    # ← НОВЕ: свій потік, свій event loop, свій Bot. Стартує ПЕРШИМ і не залежить від решти.
     powercut.start_in_background()
 
     logger.info("Starting background event loop...")

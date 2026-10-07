@@ -6,12 +6,15 @@ from flask import Flask, request
 from telegram import Update
 from telegram.ext import CommandHandler
 from bot import create_application, BOT_TOKEN, WEBHOOK_URL
-import powercut  # ← НОВЕ: незалежний моніторинг відключень
+import powercut  
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
@@ -138,7 +141,6 @@ if __name__ == "__main__":
     if not WEBHOOK_URL:
         logger.warning("WEBHOOK_URL not set!")
 
-    # ← НОВЕ: свій потік, свій event loop, свій Bot. Стартує ПЕРШИМ і не залежить від решти.
     powercut.start_in_background()
 
     logger.info("Starting background event loop...")

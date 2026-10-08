@@ -16,7 +16,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import httpx
 from bs4 import BeautifulSoup
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.error import RetryAfter
 
 logger = logging.getLogger("powercut")
@@ -34,6 +34,8 @@ STATE_PATH = os.environ.get("POWERCUT_STATE_PATH", "powercut_state.json")
 NOTIFY_ON_FIRST_RUN = os.environ.get("POWERCUT_NOTIFY_FIRST_RUN", "0") == "1"
 PHRASES_ENABLED = os.environ.get("POWERCUT_PHRASES", "1") == "1"
 GRAPH_PHRASE_CHANCE = float(os.environ.get("POWERCUT_GRAPH_PHRASE_CHANCE") or "1")  # 0..1: як часто фраза перед /graph
+PAGE_URL = os.environ.get("POWERCUT_PAGE_URL", "https://bot-v2-n8wt.onrender.com/schedule")
+PAGE_MSG_TTL = int(os.environ.get("POWERCUT_PAGE_TTL") or "60")  # через скільки сек. прибрати повідомлення з кнопкою (0 = не прибирати)
 PHRASES_PATH = os.environ.get(
     "POWERCUT_PHRASES_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "phrases.json"),
@@ -480,6 +482,41 @@ async def cmd_del(update, context) -> None:
         except Exception as e:  # вже видалено вручну / надто старе — пробуємо попереднє
             logger.warning(f"/del: не вдалося видалити {mid}: {e}")
     await _notice(context.bot, chat_id, "Немає повідомлень бота для видалення.")
+
+
+_bg_tasks: set = set()
+
+
+async def _delete_later(bot, chat_id: int, message_id: int, ttl: float) -> None:
+    await asyncio.sleep(ttl)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+
+async def cmd_web(update, context) -> None:
+    """/web — команду видаляємо, натомість кидаємо кнопку, що відкриває сторінку у вбудованому браузері."""
+    msg = update.effective_message
+    if not msg:
+        return
+    chat_id = msg.chat_id
+    chat = update.effective_chat
+    await _delete_quietly(msg)
+
+    label = "📊 Відкрити графік"
+    if chat is not None and chat.type == "private":
+        button = InlineKeyboardButton(label, web_app=WebAppInfo(url=PAGE_URL))  # міні-застосунок у приваті
+    else:
+        button = InlineKeyboardButton(label, url=PAGE_URL)  # у групах web_app-кнопки Telegram не дозволяє
+    sent = await context.bot.send_message(
+        chat_id=chat_id, text="⚡ Графік відключень", reply_markup=InlineKeyboardMarkup([[button]])
+    )
+    _record(chat_id, sent.message_id)
+    if PAGE_MSG_TTL > 0:  # у фоні, щоб не тримати вебхук відкритим
+        task = asyncio.create_task(_delete_later(context.bot, chat_id, sent.message_id, PAGE_MSG_TTL))
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
 
 
 # ──────────────────────────────────────────

@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Графіки відключень · Черкасиобленерго</title>
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);
+--bg:#eef2f7;--card:#ffffff;--tx:#0f172a;--mut:#64748b;--chip:#e5eaf2;--track:#e6ebf2;--sh:rgba(15,23,42,.16);
+--on:#2db36f;--off:#e5484d;--maybe:#f2a20f;--onx:#13854a;--offx:#d02f35;--maybex:#a86a05}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0a0f1d;--card:#131a2c;--tx:#f1f5f9;--mut:#94a3b8;--chip:#1e2842;--track:#1e2842;--sh:rgba(0,0,0,.55);--on:#34d399;--off:#fb7185;--maybe:#fbbf24;--onx:#34d399;--offx:#fb7185;--maybex:#fbbf24}}
+:root[data-theme="dark"]{--bg:#0a0f1d;--card:#131a2c;--tx:#f1f5f9;--mut:#94a3b8;--chip:#1e2842;--track:#1e2842;--sh:rgba(0,0,0,.55);--on:#34d399;--off:#fb7185;--maybe:#fbbf24;--onx:#34d399;--offx:#fb7185;--maybex:#fbbf24}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+button{font-family:inherit;-webkit-appearance:none;appearance:none}
+body{margin:0;background:var(--bg);color:var(--tx);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;display:flex;justify-content:center;padding:18px}
+.card{width:100%;max-width:440px;background:var(--card);border-radius:30px;padding:22px;box-shadow:0 12px 40px rgba(20,30,50,.10)}
+header{display:flex;justify-content:space-between;align-items:flex-start}
+h1{font-size:17px;margin:0;font-weight:650}.mut,small{color:var(--mut);font-size:12px}
+.live{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--mut)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--mut)}
+.live.ok .dot{background:var(--on);animation:blink 1.8s infinite}
+.live.stale .dot{background:var(--maybe)}
+.live.bad .dot{background:var(--off)}
+@keyframes blink{50%{opacity:.3;transform:scale(1.7)}}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin:14px 0 4px}
+.chip{border:0;background:var(--chip);color:var(--mut);padding:6px 11px;border-radius:99px;font-size:12.5px;font-weight:600;cursor:pointer;transition:all .25s}
+.chip.sel{background:var(--tx);color:var(--card)}
+.chip.dis{opacity:.38;cursor:not-allowed}
+.seg{display:none;gap:3px;background:var(--chip);padding:3px;border-radius:99px;margin-left:auto}
+.seg button{border:0;background:transparent;color:var(--mut);padding:5px 12px;border-radius:99px;font-size:12px;font-weight:700;cursor:pointer}
+.seg button.sel{background:var(--tx);color:var(--card)}
+.wrap{position:relative;margin:10px auto;width:100%;max-width:330px;height:0;padding-bottom:100%}
+svg{position:absolute;left:0;top:0;width:100%;height:100%;overflow:visible}
+.base{fill:none;stroke:var(--track)}
+.on{fill:none;stroke:var(--on);opacity:.4}
+.arc{fill:none;stroke-linecap:butt;stroke-dasharray:1;stroke-dashoffset:1;animation:draw 1.1s cubic-bezier(.3,.7,.2,1) forwards}
+.arc.static{animation:none;stroke-dashoffset:0}
+.arc.off{stroke:var(--off)}.arc.maybe{stroke:var(--maybe)}
+@keyframes draw{to{stroke-dashoffset:0}}
+.mark{fill:var(--card);stroke:var(--tx);stroke-width:2.5}
+.tick{stroke:var(--tx);stroke-width:2;stroke-linecap:round}
+svg.tm .mark,svg.tm .tick{display:none}
+.lbl{font-size:10px;font-weight:700;fill:var(--tx);pointer-events:none}
+.center{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center}
+.tc{background:var(--card);border-radius:12px;padding:5px 11px 6px;box-shadow:0 6px 16px var(--sh),0 1px 3px var(--sh);border:1px solid var(--track);margin-bottom:7px}
+.tc small{display:block;font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--mut);font-weight:700;line-height:1.2}
+.tc b{display:block;font-size:15px;font-variant-numeric:tabular-nums;font-weight:700;line-height:1.25}
+.cd{font-variant-numeric:tabular-nums;font-weight:700;margin-top:2px;font-size:15px}
+.cl{font-size:10.5px;color:var(--mut);margin-top:1px;line-height:1.2}
+.list{display:flex;flex-direction:column;gap:7px;margin-top:6px}
+.row{display:grid;grid-template-columns:34px 1fr auto;align-items:center;gap:10px;padding:10px 12px;border-radius:14px;background:var(--bg);animation:slide .5s both}
+.q{font-weight:700;font-size:13px}
+.st{font-size:12.5px}.st b{font-weight:650}
+.sub{font-size:11.5px;color:var(--mut)}
+.pill{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:6px}
+@keyframes slide{from{opacity:0;transform:translateY(8px)}}
+.toast{position:fixed;left:50%;top:calc(12px + env(safe-area-inset-top,0px));transform:translate(-50%,-150%);background:var(--tx);color:var(--card);padding:9px 16px;border-radius:99px;font-size:12.5px;transition:transform .5s cubic-bezier(.3,1.4,.5,1);z-index:9}
+.toast.show{transform:translate(-50%,0)}
+.legend{display:flex;gap:14px;margin-top:12px;font-size:11.5px;color:var(--mut);flex-wrap:wrap}
+.legend span::before{content:"";display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:var(--c)}
+.tb{border:0;background:var(--chip);color:var(--tx);width:38px;height:38px;border-radius:50%;font-size:17px;cursor:pointer;transition:transform .4s}
+.tb:active{transform:rotate(25deg) scale(.92)}
+.bar{display:flex;justify-content:flex-start;align-items:center;margin-top:10px;gap:8px;flex-wrap:wrap}
+.lab{font-size:9px;font-weight:800;letter-spacing:.07em;text-transform:uppercase;margin-top:3px;line-height:1.15}
+.lab.off,.cd.off{color:var(--offx)}.lab.on,.cd.on{color:var(--onx)}.lab.maybe,.cd.maybe{color:var(--maybex)}
+</style>
+</head>
+<body>
+<div class="toast" id="toast"></div>
+<div class="card">
+  <header>
+    <div><h1>⚡ Графіки відключень</h1><small>Черкасиобленерго · <span id="date"></span></small></div>
+    <button class="tb" id="tb" aria-label="Змінити тему">🌙</button>
+  </header>
+  <div class="bar">
+    <div class="live" id="live"><span class="dot"></span><span id="livet">завантаження…</span></div>
+    <div class="seg" id="seg"><button data-v="today" class="sel">Сьогодні</button><button data-v="tomorrow">Завтра</button></div>
+  </div>
+  <div class="chips" id="chips"></div>
+  <div class="wrap" id="wrap"><svg viewBox="0 0 300 300" id="svg"></svg><div class="center" id="center"><div class="tc"><small>Зараз</small><b id="now">--:--:--</b></div><div class="lab" id="lab"></div><div class="cd" id="cd"></div><div class="cl" id="cl"></div></div></div>
+  <div class="list" id="list"></div>
+  <div class="legend" style="margin-bottom:0"><span style="--c:var(--on)">Світло є</span><span style="--c:var(--off)">Відключення</span></div>
+  <p class="mut" id="upd" style="margin:10px 0 0"></p>
+</div>
+<script>
+// Усі 12 черг показуються, але вмикаються лише ті, які реально парсить бот (поле "queues" в /api/schedule).
+var QS=["1.1","1.2","2.1","2.2","3.1","3.2","4.1","4.2","5.1","5.2","6.1","6.2"];
+var MAX=4,C=150,R0=134,W=18,STEP=21,POLL=10000,FRESH=90;
+var $=function(i){return document.getElementById(i)};
+var api=null,sel=[],animQ=null,view="today",sigs={},fetchedAt=0,failed=false,lastKey="";
+var saved=[];try{saved=JSON.parse(localStorage.getItem("sel")||"[]")||[]}catch(e){}
+
+/* ---------- час (Київ) ---------- */
+function mkFmt(opts){try{return new Intl.DateTimeFormat("en-GB",Object.assign({timeZone:"Europe/Kyiv"},opts))}catch(e){return new Intl.DateTimeFormat("en-GB",Object.assign({timeZone:"Europe/Kiev"},opts))}}
+var FM=mkFmt({hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false});
+var DF=mkFmt({year:"numeric",month:"2-digit",day:"2-digit"});
+function kyiv(){var o={};FM.formatToParts(new Date()).forEach(function(p){o[p.type]=+p.value});o.hour=o.hour%24;return o}
+function nowMin(){var k=kyiv();return k.hour*60+k.minute+k.second/60}
+function keyOf(){var o={};DF.formatToParts(new Date()).forEach(function(p){o[p.type]=p.value});return o.year+"-"+o.month+"-"+o.day}
+function addDay(k,n){var p=k.split("-");return new Date(Date.UTC(+p[0],+p[1]-1,+p[2]+n)).toISOString().slice(0,10)}
+function viewKey(){return view==="tomorrow"?addDay(keyOf(),1):keyOf()}
+function pad(x){return String(x).padStart(2,"0")}
+function hm(m){if(m===1440)return"24:00";m=((Math.round(m)%1440)+1440)%1440;return pad(Math.floor(m/60))+":"+pad(m%60)}
+function hhmm(ms){try{return new Date(ms).toLocaleTimeString("uk-UA",{hour:"2-digit",minute:"2-digit",timeZone:"Europe/Kyiv"})}catch(e){return""}}
+
+/* ---------- дані бота ---------- */
+function enabled(q){return !!(api&&api.queues&&api.queues.indexOf(q)>-1)}
+function dayRec(q,key){var d=api&&api.days&&api.days[key];return d&&d[q]?d[q]:null}
+function daySlots(q,key){var r=dayRec(q,key);return r?r.slots:null}
+function hasTomorrow(){var k=addDay(keyOf(),1);return QS.some(function(q){return enabled(q)&&daySlots(q,k)!==null})}
+// суцільна лінія часу: сьогодні + завтра (зсув 1440), сусідні інтервали зливаються (23:00–24:00 + 00:00–01:00)
+function timeline(q){
+  var t=[],a=daySlots(q,keyOf())||[],b=daySlots(q,addDay(keyOf(),1))||[];
+  a.forEach(function(x){t.push({s:x.s,e:x.e})});
+  b.forEach(function(x){t.push({s:x.s+1440,e:x.e+1440})});
+  t.sort(function(x,y){return x.s-y.s});
+  var m=[];t.forEach(function(x){var l=m[m.length-1];if(l&&x.s<=l.e)l.e=Math.max(l.e,x.e);else m.push({s:x.s,e:x.e})});
+  return m;
+}
+function dayTag(m){return m>1440?" (завтра)":""}
+function status(q){
+  if(daySlots(q,keyOf())===null)return{nodata:true,txt:"немає даних на сьогодні"};
+  var n=nowMin(),cur=null,nx=null;
+  timeline(q).forEach(function(x){if(n>=x.s&&n<x.e)cur=x;else if(x.s>n&&!nx)nx=x});
+  if(cur)return{off:true,at:cur.e,txt:"до "+hm(cur.e)+dayTag(cur.e)};
+  if(nx)return{off:false,next:true,at:nx.s,txt:"до "+hm(nx.s)+dayTag(nx.s)};
+  return{off:false,at:null,txt:"до кінця доби"};
+}
+
+/* ---------- малювання ---------- */
+function pt(m,r){var a=m/1440*2*Math.PI-Math.PI/2;return[C+r*Math.cos(a),C+r*Math.sin(a)]}
+function arc(s,e,r){var p=pt(s,r),q=pt(e,r);return"M"+p[0].toFixed(2)+" "+p[1].toFixed(2)+"A"+r+" "+r+" 0 "+(e-s>720?1:0)+" 1 "+q[0].toFixed(2)+" "+q[1].toFixed(2)}
+function drawRings(){
+  var h="",vk=viewKey();
+  sel.forEach(function(q,k){
+    var r=R0-k*STEP;
+    h+='<circle class="base" cx="150" cy="150" r="'+r+'" stroke-width="'+W+'"/><circle class="on" cx="150" cy="150" r="'+r+'" stroke-width="'+W+'"/>';
+    (daySlots(q,vk)||[]).forEach(function(x,i){
+      var st=(animQ&&animQ!==q)?" static":"",parts=(x.e-x.s>=1440)?[[x.s,x.s+720],[x.s+720,x.e]]:[[x.s,x.e]];
+      parts.forEach(function(p){h+='<path class="arc '+x.t+st+'" pathLength="1" stroke-width="'+W+'" style="animation-delay:'+(k*.12+i*.15)+'s" d="'+arc(p[0],p[1],r)+'"/>'});
+    });
+    h+='<text class="lbl" x="150" y="'+(150-r)+'" text-anchor="middle" dy=".35em">'+q+'</text>';
+    h+='<circle class="mark" cx="150" cy="'+(150-r)+'" r="5.5"/>';
+  });
+  h+='<line class="tick" id="tick" x1="150" y1="'+(150-R0-12)+'" x2="150" y2="'+(150-R0-7)+'"/>';
+  $("svg").innerHTML=h;
+  $("svg").setAttribute("class",view==="tomorrow"?"tm":"");
+  var inner=R0-(Math.max(sel.length,1)-1)*STEP-W/2-8;
+  $("center").style.width=(inner*2/300*100)+"%";
+}
+function renderChips(){
+  $("chips").innerHTML=QS.map(function(q){
+    var on=enabled(q);
+    return'<button class="chip'+(sel.indexOf(q)>-1?" sel":"")+(on?"":" dis")+'" data-q="'+q+'" aria-disabled="'+(on?"false":"true")+'"'+(on?"":' title="Бот поки не парсить цю чергу"')+'>'+q+'</button>';
+  }).join("");
+}
+function segUi(){
+  var has=hasTomorrow();
+  if(!has&&view==="tomorrow")view="today";
+  $("seg").style.display=has?"flex":"none";
+  var b=$("seg").querySelectorAll("button");
+  for(var i=0;i<b.length;i++)b[i].className=b[i].getAttribute("data-v")===view?"sel":"";
+}
+function setDate(){
+  try{$("date").textContent=new Date(viewKey()+"T12:00:00Z").toLocaleDateString("uk-UA",{day:"numeric",month:"long",timeZone:"UTC"})}catch(e){}
+}
+function liveUi(){
+  var el=$("live"),t=$("livet");
+  if(failed){el.className="live bad";t.textContent="немає зв'язку з сервером";return}
+  if(!api){el.className="live";t.textContent="завантаження…";return}
+  if(api.checkedAt==null){el.className="live stale";t.textContent="бот ще збирає дані";return}
+  var age=Math.max(0,Math.round((api.serverTime-api.checkedAt+(Date.now()-fetchedAt))/1000));
+  var txt=age<60?age+" с":Math.floor(age/60)+" хв";
+  if(age<=FRESH){el.className="live ok";t.textContent="наживо · перевірено "+txt+" тому"}
+  else{el.className="live stale";t.textContent="дані застаріли · остання перевірка "+txt+" тому"}
+}
+function upd(){
+  if(!api){$("upd").textContent="";return}
+  if(!sel.length){$("upd").textContent=enabled(QS[0])||api.queues.length?"":"Бот ще не отримав графіків.";return}
+  var m=0,vk=viewKey();sel.forEach(function(q){var r=dayRec(q,vk);if(r&&r.updatedAt)m=Math.max(m,r.updatedAt)});
+  $("upd").textContent=m?"Останній графік у каналі опубліковано о "+hhmm(m):"";
+}
+function tick(){
+  var n=nowMin(),rot="rotate("+(n/1440*360)+" 150 150)";
+  var tk=$("tick");if(tk)tk.setAttribute("transform",rot);
+  var ms=document.querySelectorAll(".mark");for(var i=0;i<ms.length;i++)ms[i].setAttribute("transform",rot);
+  var k0=kyiv();$("now").textContent=pad(k0.hour)+":"+pad(k0.minute)+":"+pad(k0.second);
+  liveUi();
+  var kk=keyOf();if(api&&lastKey&&kk!==lastKey){lastKey=kk;animQ=null;segUi();setDate();drawRings();$("list").dataset.k="";}
+  lastKey=kk;
+  if(!api){$("lab").textContent="Завантаження";$("lab").className="lab";$("cd").textContent="";$("cl").textContent="";return}
+  if(!sel.length){$("lab").textContent=api.queues.length?"Оберіть чергу":"Немає даних";$("lab").className="lab";$("cd").textContent="";$("cl").textContent="";return}
+  var q=sel[0],s=status(q);
+  var sec=s.at!=null?Math.max(0,Math.round((s.at-n)*60)):null;
+  var cls="",lab;
+  if(s.nodata){lab="Немає даних";sec=null}
+  else if(s.off){cls="on";lab="До ввімкнення"}
+  else if(s.next){cls="off";lab="До відключення"}
+  else{cls="on";lab="Відключень більше немає"}
+  $("lab").textContent=lab;$("lab").className="lab "+cls;
+  $("cd").className="cd "+cls;
+  $("cd").textContent=sec!=null?pad(Math.floor(sec/3600))+":"+pad(Math.floor(sec/60)%60)+":"+pad(sec%60):"";
+  $("cl").textContent="черга "+q;
+  if($("list").dataset.k!=="ok"){
+    var h="",vk=viewKey();
+    sel.forEach(function(q,i){
+      var sl=daySlots(q,vk),r=dayRec(q,vk),txt;
+      if(sl===null)txt="немає даних на цей день";
+      else if(!sl.length)txt="відключень немає";
+      else txt=sl.slice().sort(function(a,b){return a.s-b.s}).map(function(x){return hm(x.s)+"–"+hm(x.e)}).join(" · ");
+      if(r&&r.updatedAt)txt+=" · оновлено "+hhmm(r.updatedAt);
+      h+='<div class="row" style="animation-delay:'+(i*.07)+'s"><span class="q">'+q+'</span><div><div class="st" id="st-'+q.replace(".","")+'"></div><div class="sub">'+txt+'</div></div></div>';
+    });
+    $("list").innerHTML=h;$("list").dataset.k="ok";
+  }
+  sel.forEach(function(q){
+    var s=status(q),col=s.nodata?"mut":(s.off?"off":"on");
+    var txt=s.nodata?"Немає даних":(s.off?"Світла немає":"Світло є");
+    var e=$("st-"+q.replace(".",""));
+    var html='<span class="pill" style="background:var(--'+col+')"></span><b>'+txt+'</b> <span class="mut">'+s.txt+'</span>';
+    if(e&&e.dataset.h!==html){e.innerHTML=html;e.dataset.h=html}
+  });
+}
+function toast(t){var e=$("toast");e.textContent=t;e.classList.add("show");setTimeout(function(){e.classList.remove("show")},3000)}
+function full(){renderChips();segUi();setDate();drawRings();$("list").dataset.k="";tick();upd()}
+
+/* ---------- отримання даних від бота ---------- */
+function applyApi(j){
+  var first=!api,changed=[],prevQ=api?api.queues.join(","):"";
+  var ns={};
+  Object.keys(j.days||{}).forEach(function(k){Object.keys(j.days[k]).forEach(function(q){
+    var sg=JSON.stringify(j.days[k][q].slots);ns[q+"|"+k]=sg;
+    if(!first&&sigs[q+"|"+k]!==sg&&k===keyOf())changed.push(q);
+  })});
+  sigs=ns;api=j;fetchedAt=Date.now();failed=false;lastKey=keyOf();
+  var en=QS.filter(enabled);
+  if(first){
+    sel=saved.filter(function(q){return en.indexOf(q)>-1}).slice(0,MAX);
+    if(!sel.length&&en.length)sel=[en.indexOf("2.1")>-1?"2.1":en[0]];
+  }else sel=sel.filter(function(q){return en.indexOf(q)>-1});
+  var vis=changed.filter(function(q){return sel.indexOf(q)>-1});
+  var redraw=first||changed.length||prevQ!==j.queues.join(",");
+  if(redraw){
+    animQ=vis.length&&view==="today"?vis[0]:null;
+    full();
+    if(vis.length)toast("🔄 Графік черги "+vis[0]+" оновлено");
+  }else{segUi();upd();liveUi()}
+}
+function poll(){
+  if(document.hidden&&api)return;
+  var ctl=window.AbortController?new AbortController():null;
+  var to=setTimeout(function(){if(ctl)ctl.abort()},8000);
+  fetch("/api/schedule",{cache:"no-store",signal:ctl?ctl.signal:undefined})
+    .then(function(r){if(!r.ok)throw new Error("http "+r.status);return r.json()})
+    .then(function(j){clearTimeout(to);applyApi(j)})
+    .catch(function(){clearTimeout(to);failed=true;liveUi()});
+}
+
+/* ---------- взаємодія ---------- */
+$("chips").onclick=function(e){
+  var b=e.target.closest?e.target.closest("button"):e.target,q=b&&b.dataset&&b.dataset.q;if(!q)return;
+  if(b.classList.contains("dis")){toast("Бот поки не парсить чергу "+q);return}
+  var i=sel.indexOf(q);
+  if(i>-1)sel.splice(i,1);else{if(sel.length>=MAX){toast("Можна показати до "+MAX+" черг");return}sel.push(q)}
+  try{localStorage.setItem("sel",JSON.stringify(sel))}catch(x){}
+  animQ=null;renderChips();drawRings();$("list").dataset.k="";tick();upd();
+};
+$("seg").onclick=function(e){
+  var v=e.target.getAttribute&&e.target.getAttribute("data-v");if(!v||v===view)return;
+  view=v;animQ=null;segUi();setDate();drawRings();$("list").dataset.k="";tick();upd();
+};
+function setTheme(m,save){document.documentElement.setAttribute("data-theme",m);$("tb").textContent=m=="dark"?"☀️":"🌙";if(save)try{localStorage.setItem("theme",m)}catch(e){}}
+var th=null;try{th=localStorage.getItem("theme")}catch(e){}
+setTheme(th||(window.matchMedia&&matchMedia("(prefers-color-scheme:dark)").matches?"dark":"light"),false);
+$("tb").onclick=function(){setTheme(document.documentElement.getAttribute("data-theme")=="dark"?"light":"dark",true)};
+document.addEventListener("visibilitychange",function(){if(!document.hidden)poll()});
+
+renderChips();setDate();drawRings();tick();
+setInterval(tick,1000);
+poll();setInterval(poll,POLL);
+</script>
+</body>
+</html>

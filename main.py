@@ -25,6 +25,7 @@ app = Flask(__name__)
 telegram_app = create_application()
 telegram_app.add_handler(CommandHandler("graph", powercut.cmd_graph))  # ← НОВЕ: /graph (для всіх)
 telegram_app.add_handler(CommandHandler("del", powercut.cmd_del))      # ← НОВЕ: /del (видалити останнє повідомлення бота)
+telegram_app.add_handler(CommandHandler("web", powercut.cmd_web))      # ← НОВЕ: /web (відкрити сторінку з графіком)
 powercut.add_registry(_sent_messages)                                  # ← НОВЕ: /del бачить і відео з bot.py
 loop = None
 

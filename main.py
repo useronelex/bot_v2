@@ -6,7 +6,7 @@ import os
 import logging
 import asyncio
 from threading import Thread
-from flask import Flask, request
+from flask import Flask, request, jsonify, send_file
 from telegram import Update
 from telegram.ext import CommandHandler
 from bot import create_application, BOT_TOKEN, WEBHOOK_URL, _sent_messages
@@ -17,9 +17,10 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-logging.getLogger("werkzeug").setLevel(logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("werkzeug").setLevel(logging.WARNING)  # без рядків з токеном і запитів сторінки/пінгу
+logging.getLogger("httpx").setLevel(logging.WARNING)     # без "GET t.me ..." кожні 10 секунд
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 app = Flask(__name__)
 telegram_app = create_application()
 telegram_app.add_handler(CommandHandler("graph", powercut.cmd_graph))  # ← НОВЕ: /graph (для всіх)
@@ -56,6 +57,20 @@ def health():
         "bot_configured": bool(BOT_TOKEN and WEBHOOK_URL),
         "powercut": powercut.status(),  # ← НОВЕ
     }, 200
+
+
+@app.route("/schedule")
+def schedule_page():  # ← НОВЕ: веб-сторінка з графіками
+    resp = send_file(os.path.join(BASE_DIR, "schedule.html"), mimetype="text/html")
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+@app.route("/api/schedule")
+def schedule_api():  # ← НОВЕ: дані, які розпарсив бот (їх читає сторінка)
+    resp = jsonify(powercut.api_data())
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])

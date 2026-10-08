@@ -1,14 +1,6 @@
 """
 powercut.py — незалежний моніторинг графіків відключень світла.
 
-Читає публічну веб-версію Telegram-каналу (https://t.me/s/<канал>), витягує графіки
-для заданих черг і надсилає в чат повідомлення ЛИШЕ коли графік з'явився або змінився.
-
-Працює у власному потоці зі своїм event loop і своїм екземпляром Bot, тому:
-  * не залежить від bot.py (yt-dlp, Instagram, ffprobe тощо);
-  * сам перезапускається після будь-якої помилки;
-  * його легко винести в окремий сервіс:  python powercut.py
-
 """
 
 import asyncio
@@ -158,14 +150,23 @@ def parse_message(text: str, today: date) -> tuple[date, dict[str, list[list[int
     return (day, queues) if queues else None
 
 
-def build_current(texts: list[str], today: date) -> dict[date, dict[str, list[list[int]]]]:
-    """Останнє (найновіше) повідомлення для дати перекриває попередні — по кожній черзі."""
+def build_current_ts(msgs: list[tuple[str, float | None]], today: date):
+    """Те саме, що build_current, але ще повертає час публікації повідомлення для кожної дати/черги."""
     current: dict[date, dict[str, list[list[int]]]] = {}
-    for text in texts:
+    times: dict[date, dict[str, float | None]] = {}
+    for text, ts in msgs:
         parsed = parse_message(text, today)
         if parsed:
-            current.setdefault(parsed[0], {}).update(parsed[1])
-    return current
+            d, queues = parsed
+            current.setdefault(d, {}).update(queues)
+            for q in queues:
+                times.setdefault(d, {})[q] = ts
+    return current, times
+
+
+def build_current(texts: list[str], today: date) -> dict[date, dict[str, list[list[int]]]]:
+    """Останнє (найновіше) повідомлення для дати перекриває попередні — по кожній черзі."""
+    return build_current_ts([(t, None) for t in texts], today)[0]
 
 
 # ──────────────────────────────────────────
@@ -271,7 +272,8 @@ def _save_state(state: dict) -> None:
 # ──────────────────────────────────────────
 # МЕРЕЖА / TELEGRAM
 # ──────────────────────────────────────────
-async def _fetch_texts(client: httpx.AsyncClient) -> list[str]:
+async def _fetch_messages(client: httpx.AsyncClient) -> list[tuple[str, float | None]]:
+    """[(текст, час_публікації_unix | None), ...] від найстарішого до найновішого."""
     r = await client.get(URL)
     if r.status_code == 429:
         try:
@@ -281,14 +283,34 @@ async def _fetch_texts(client: httpx.AsyncClient) -> list[str]:
         raise _RateLimited(ra)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
-    texts = []
-    for el in soup.select("div.tgme_widget_message_text"):
+    msgs: list[tuple[str, float | None]] = []
+
+    def _text(el) -> str:
         for br in el.find_all("br"):
             br.replace_with("\n")
-        texts.append(el.get_text())
-    if not texts:
+        return el.get_text()
+
+    for wrap in soup.select("div.tgme_widget_message"):
+        el = wrap.select_one(".tgme_widget_message_text")
+        if not el:
+            continue
+        ts = None
+        t = wrap.select_one("a.tgme_widget_message_date time[datetime]") or wrap.select_one("time[datetime]")
+        if t:
+            try:
+                ts = datetime.fromisoformat(t["datetime"]).timestamp()
+            except Exception:
+                ts = None
+        msgs.append((_text(el), ts))
+    if not msgs:  # запасний розбір без часу
+        msgs = [(_text(el), None) for el in soup.select("div.tgme_widget_message_text")]
+    if not msgs:
         raise RuntimeError("На сторінці каналу не знайдено повідомлень")
-    return texts
+    return msgs
+
+
+async def _fetch_texts(client: httpx.AsyncClient) -> list[str]:
+    return [t for t, _ in await _fetch_messages(client)]
 
 
 async def _send(bot: Bot, chat_id: int, text: str) -> bool:
@@ -465,6 +487,7 @@ async def cmd_del(update, context) -> None:
 # ──────────────────────────────────────────
 async def _monitor(bot: Bot) -> None:
     state = _load_state()
+    _publish_api_from_state(state)
     fails = 0
     fail_since: float | None = None
     alerted = False
@@ -480,8 +503,10 @@ async def _monitor(bot: Bot) -> None:
         while True:
             delay = POLL_INTERVAL * random.uniform(0.8, 1.2)
             try:
-                texts = await _fetch_texts(client)
+                msgs = await _fetch_messages(client)
+                texts = [t for t, _ in msgs]
                 _cache["texts"], _cache["ts"] = texts, time.time()
+                _publish_api(msgs)
                 if fails:
                     logger.info(f"Канал знову доступний після {fails} помилок")
                 fails, fail_since = 0, None
@@ -556,6 +581,67 @@ def start_in_background() -> None:
     _status["started"] = time.time()
     _thread = threading.Thread(target=_thread_main, name="powercut", daemon=True)
     _thread.start()
+
+
+# ──────────────────────────────────────────
+# ДАНІ ДЛЯ ВЕБ-СТОРІНКИ (/api/schedule)
+# ──────────────────────────────────────────
+_api: dict = {"data": None}
+
+
+def _ms(ts: float | None) -> int | None:
+    return int(ts * 1000) if ts else None
+
+
+def build_api(current: dict, times: dict, today: date, checked_at: float | None) -> dict:
+    days: dict = {}
+    for d, qs in sorted(current.items()):
+        if d < today or d > today + timedelta(days=2):
+            continue
+        days[d.isoformat()] = {
+            q: {
+                "slots": [{"s": s, "e": e, "t": "off"} for s, e in iv],
+                "updatedAt": _ms(times.get(d, {}).get(q)),
+            }
+            for q, iv in qs.items()
+        }
+    return {
+        "today": today.isoformat(),
+        "queues": list(QUEUES),
+        "days": days,
+        "checkedAt": _ms(checked_at),
+        "pollSec": POLL_INTERVAL,
+    }
+
+
+def _publish_api(msgs: list[tuple[str, float | None]]) -> None:
+    try:
+        today = _now_kyiv().date()
+        current, times = build_current_ts(msgs, today)
+        _api["data"] = build_api(current, times, today, time.time())
+    except Exception as e:
+        logger.warning(f"Не вдалося оновити дані для веб-сторінки: {e}")
+
+
+def _publish_api_from_state(state: dict) -> None:
+    """Одразу після старту (до першої вичитки каналу) віддаємо те, що збережено в стані."""
+    try:
+        today = _now_kyiv().date()
+        current = {date.fromisoformat(k): v for k, v in state.get("schedules", {}).items()}
+        _api["data"] = build_api(current, {}, today, None)
+    except Exception as e:
+        logger.warning(f"Не вдалося підготувати дані зі стану: {e}")
+
+
+def api_data() -> dict:
+    data = _api["data"]
+    out = dict(data) if data else {
+        "today": _now_kyiv().date().isoformat(), "queues": list(QUEUES), "days": {},
+        "checkedAt": None, "pollSec": POLL_INTERVAL,
+    }
+    out["ready"] = bool(data)
+    out["serverTime"] = int(time.time() * 1000)
+    return out
 
 
 def status() -> dict:

@@ -32,6 +32,11 @@ QUEUES = tuple(q.strip() for q in os.environ.get("POWERCUT_QUEUES", "1.1,2.1,3.1
 POLL_INTERVAL = max(5.0, float(os.environ.get("POWERCUT_POLL_SEC") or "10"))
 STATE_PATH = os.environ.get("POWERCUT_STATE_PATH", "powercut_state.json")
 NOTIFY_ON_FIRST_RUN = os.environ.get("POWERCUT_NOTIFY_FIRST_RUN", "0") == "1"
+PHRASES_ENABLED = os.environ.get("POWERCUT_PHRASES", "1") == "1"
+PHRASES_PATH = os.environ.get(
+    "POWERCUT_PHRASES_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "phrases.json"),
+)
 ALERT_AFTER_SEC = 300  # якщо канал недоступний стільки часів поспіль — сповістити адміна
 
 URL = f"https://t.me/s/{CHANNEL}"
@@ -188,6 +193,46 @@ def fmt_changed(d: date, old: dict, new: dict, diff: list[str]) -> str:
 
 
 # ──────────────────────────────────────────
+# ФРАЗИ ПЕРЕД ГРАФІКОМ
+# ──────────────────────────────────────────
+_last_phrase: dict[str, str] = {}
+_phrased: set[str] = set()  # сповіщення, для яких фразу вже надіслано (щоб не дублювати при повторі)
+
+
+def _total(intervals: list[list[int]] | None) -> int:
+    return sum(e - s for s, e in intervals or [])
+
+
+def classify_change(old: dict, new: dict, diff: list[str]) -> str:
+    """Тип зміни: відключень стало більше / менше / стільки ж, але в інший час."""
+    before = sum(_total(old.get(q)) for q in diff)
+    after = sum(_total(new.get(q)) for q in diff)
+    if after > before:
+        return "changed_worse"
+    if after < before:
+        return "changed_better"
+    return "changed_shifted"
+
+
+def pick_phrase(event: str) -> str | None:
+    """Випадкова фраза для події з phrases.json (файл перечитується щоразу, тож правки діють без перезапуску)."""
+    try:
+        with open(PHRASES_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        data = data.get("blackout_responses", data)
+        items = [x for x in (data.get(event) or []) if isinstance(x, str) and x.strip()]
+    except Exception as e:
+        logger.warning(f"Не вдалося прочитати {PHRASES_PATH}: {e}")
+        return None
+    if not items:
+        return None
+    last = _last_phrase.get(event)
+    phrase = random.choice([x for x in items if x != last] or items)
+    _last_phrase[event] = phrase
+    return phrase
+
+
+# ──────────────────────────────────────────
 # СТАН
 # ──────────────────────────────────────────
 def _load_state() -> dict:
@@ -277,14 +322,24 @@ async def _process(bot: Bot, texts: list[str], state: dict, today: date) -> None
                 dirty = True
                 continue
             msg = fmt_new(d, queues)
+            event = "new_schedule"
         else:
             diff = [q for q in QUEUES if q in queues and old.get(q) != queues[q]]
             if not diff:
                 continue
             msg = fmt_changed(d, old, queues, diff)
+            event = classify_change(old, queues, diff)
+
+        # 1) окреме повідомлення з фразою, 2) сам графік
+        if PHRASES_ENABLED and msg not in _phrased:
+            phrase = pick_phrase(event)
+            if phrase and await _send(bot, CHAT_ID, phrase):
+                _phrased.add(msg)
+                await asyncio.sleep(1)
 
         if await _send(bot, CHAT_ID, msg):
-            logger.info(f"Надіслано сповіщення про графік на {key}")
+            logger.info(f"Надіслано сповіщення про графік на {key} ({event})")
+            _phrased.discard(msg)
             schedules[key] = {**(old or {}), **queues}
             dirty = True
         else:

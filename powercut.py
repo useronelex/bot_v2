@@ -33,7 +33,7 @@ POLL_INTERVAL = max(5.0, float(os.environ.get("POWERCUT_POLL_SEC") or "10"))
 STATE_PATH = os.environ.get("POWERCUT_STATE_PATH", "powercut_state.json")
 NOTIFY_ON_FIRST_RUN = os.environ.get("POWERCUT_NOTIFY_FIRST_RUN", "0") == "1"
 PHRASES_ENABLED = os.environ.get("POWERCUT_PHRASES", "1") == "1"
-GRAPH_PHRASE_CHANCE = float(os.environ.get("POWERCUT_GRAPH_PHRASE_CHANCE") or "1")  # 0..1: як часто фраза перед /graph
+GRAPH_PHRASE_CHANCE = float(os.environ.get("POWERCUT_GRAPH_PHRASE_CHANCE") or "0")  # 0..1: як часто фраза перед /graph
 PAGE_URL = os.environ.get("POWERCUT_PAGE_URL", "https://bot-v2-n8wt.onrender.com/schedule")
 MINIAPP_URL = os.environ.get("POWERCUT_MINIAPP_URL", "")  # https://t.me/<бот>/<короткa_назва> — для кнопки в групах
 BUTTON_ENABLED = os.environ.get("POWERCUT_BUTTON", "1") == "1"  # кнопка "Відкрити графік" під повідомленнями з графіком

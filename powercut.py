@@ -35,6 +35,7 @@ NOTIFY_ON_FIRST_RUN = os.environ.get("POWERCUT_NOTIFY_FIRST_RUN", "0") == "1"
 PHRASES_ENABLED = os.environ.get("POWERCUT_PHRASES", "1") == "1"
 GRAPH_PHRASE_CHANCE = float(os.environ.get("POWERCUT_GRAPH_PHRASE_CHANCE") or "1")  # 0..1: як часто фраза перед /graph
 PAGE_URL = os.environ.get("POWERCUT_PAGE_URL", "https://bot-v2-n8wt.onrender.com/schedule")
+MINIAPP_URL = os.environ.get("POWERCUT_MINIAPP_URL", "")  # https://t.me/<бот>/<короткa_назва> — для кнопки в групах
 PAGE_MSG_TTL = int(os.environ.get("POWERCUT_PAGE_TTL") or "60")  # через скільки сек. прибрати повідомлення з кнопкою (0 = не прибирати)
 PHRASES_PATH = os.environ.get(
     "POWERCUT_PHRASES_PATH",
@@ -508,7 +509,8 @@ async def cmd_web(update, context) -> None:
     if chat is not None and chat.type == "private":
         button = InlineKeyboardButton(label, web_app=WebAppInfo(url=PAGE_URL))  # міні-застосунок у приваті
     else:
-        button = InlineKeyboardButton(label, url=PAGE_URL)  # у групах web_app-кнопки Telegram не дозволяє
+        # у групах web_app-кнопки Telegram не дозволяє; пряме посилання на міні-застосунок відкриє його як застосунок
+        button = InlineKeyboardButton(label, url=MINIAPP_URL or PAGE_URL)
     sent = await context.bot.send_message(
         chat_id=chat_id, text="⚡ Графік відключень", reply_markup=InlineKeyboardMarkup([[button]])
     )
@@ -687,6 +689,7 @@ def status() -> dict:
         "last_ok_sec_ago": round(time.time() - _status["last_ok"]) if _status["last_ok"] else None,
         "last_error": _status["last_error"],
         "restarts": _status["restarts"],
+        "miniapp_url": MINIAPP_URL or None,  # якщо None — кнопка /web у групі веде на звичайний сайт
     }
 
 

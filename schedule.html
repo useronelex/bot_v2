@@ -31,18 +31,23 @@ h1{font-size:17px;margin:0;font-weight:650}.mut,small{color:var(--mut);font-size
 .seg{display:none;gap:3px;background:var(--chip);padding:3px;border-radius:99px;margin-left:auto}
 .seg button{border:0;background:transparent;color:var(--mut);padding:5px 12px;border-radius:99px;font-size:12px;font-weight:700;cursor:pointer}
 .seg button.sel{background:var(--tx);color:var(--card)}
-.wrap{position:relative;margin:10px auto;width:100%;max-width:330px;height:0;padding-bottom:100%}
+.wrap{position:relative;margin:10px auto;width:100%;max-width:380px;height:0;padding-bottom:100%}
 svg{position:absolute;left:0;top:0;width:100%;height:100%;overflow:visible}
 .base{fill:none;stroke:var(--track)}
-.on{fill:none;stroke:var(--on);opacity:.4}
+.okring{fill:none;stroke:var(--on);opacity:.4}
 .arc{fill:none;stroke-linecap:butt;stroke-dasharray:1;stroke-dashoffset:1;animation:draw 1.1s cubic-bezier(.3,.7,.2,1) forwards}
 .arc.static{animation:none;stroke-dashoffset:0}
 .arc.off{stroke:var(--off)}.arc.maybe{stroke:var(--maybe)}
 @keyframes draw{to{stroke-dashoffset:0}}
-.mark{fill:var(--card);stroke:var(--tx);stroke-width:2.5}
-.tick{stroke:var(--tx);stroke-width:2;stroke-linecap:round}
-svg.tm .mark,svg.tm .tick{display:none}
-.lbl{font-size:10px;font-weight:700;fill:var(--tx);pointer-events:none}
+.hl-b{stroke:var(--card);stroke-width:5;stroke-linecap:round}
+.hl{stroke:var(--tx);stroke-width:2;stroke-linecap:round}
+.hp{fill:var(--tx);stroke:var(--tx);stroke-width:2;stroke-linejoin:round}
+svg.tm #hand{display:none}
+.tk{stroke:var(--mut);stroke-width:1.2;stroke-linecap:round;opacity:.7}
+.tkm{stroke:var(--tx);stroke-width:2;stroke-linecap:round}
+.hr{font-size:11px;font-weight:700;fill:var(--mut);text-anchor:middle;pointer-events:none}
+.hr.k{fill:var(--tx)}
+.lbl{font-size:10px;font-weight:700;fill:var(--tx);pointer-events:none;paint-order:stroke;stroke:var(--card);stroke-width:3px;stroke-linejoin:round}
 .center{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center}
 .tc{background:var(--card);border-radius:12px;padding:5px 11px 6px;box-shadow:0 6px 16px var(--sh),0 1px 3px var(--sh);border:1px solid var(--track);margin-bottom:7px}
 .tc small{display:block;font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--mut);font-weight:700;line-height:1.2}
@@ -79,7 +84,7 @@ svg.tm .mark,svg.tm .tick{display:none}
     <div class="seg" id="seg"><button data-v="today" class="sel">Сьогодні</button><button data-v="tomorrow">Завтра</button></div>
   </div>
   <div class="chips" id="chips"></div>
-  <div class="wrap" id="wrap"><svg viewBox="0 0 300 300" id="svg"></svg><div class="center" id="center"><div class="tc"><small>Зараз</small><b id="now">--:--:--</b></div><div class="lab" id="lab"></div><div class="cd" id="cd"></div><div class="cl" id="cl"></div></div></div>
+  <div class="wrap" id="wrap"><svg viewBox="-30 -30 360 360" id="svg"></svg><div class="center" id="center"><div class="tc"><small>Зараз</small><b id="now">--:--:--</b></div><div class="lab" id="lab"></div><div class="cd" id="cd"></div><div class="cl" id="cl"></div></div></div>
   <div class="list" id="list"></div>
   <div class="legend" style="margin-bottom:0"><span style="--c:var(--on)">Світло є</span><span style="--c:var(--off)">Відключення</span></div>
   <p class="mut" id="upd" style="margin:10px 0 0"></p>
@@ -133,23 +138,35 @@ function status(q){
 /* ---------- малювання ---------- */
 function pt(m,r){var a=m/1440*2*Math.PI-Math.PI/2;return[C+r*Math.cos(a),C+r*Math.sin(a)]}
 function arc(s,e,r){var p=pt(s,r),q=pt(e,r);return"M"+p[0].toFixed(2)+" "+p[1].toFixed(2)+"A"+r+" "+r+" 0 "+(e-s>720?1:0)+" 1 "+q[0].toFixed(2)+" "+q[1].toFixed(2)}
+// шкала годин зовні кола (як на годиннику): 24 поділки, підписи кожні 3 год, північ угорі, за годинниковою стрілкою
+function scale(){
+  var E=R0+W/2,h="";
+  for(var i=0;i<24;i++){
+    var a=i*15*Math.PI/180,sn=Math.sin(a),cs=-Math.cos(a),major=i%3===0,r1=E+5,r2=E+(major?13:9);
+    h+='<line class="'+(major?"tkm":"tk")+'" x1="'+(C+r1*sn).toFixed(2)+'" y1="'+(C+r1*cs).toFixed(2)+'" x2="'+(C+r2*sn).toFixed(2)+'" y2="'+(C+r2*cs).toFixed(2)+'"/>';
+    if(major){var rl=E+27;h+='<text class="hr'+(i%12===0?" k":"")+'" dy=".35em" x="'+(C+rl*sn).toFixed(2)+'" y="'+(C+rl*cs).toFixed(2)+'">'+i+'</text>'}
+  }
+  return h;
+}
 function drawRings(){
-  var h="",vk=viewKey();
+  var h=scale(),vk=viewKey(),E=R0+W/2;
   sel.forEach(function(q,k){
     var r=R0-k*STEP;
-    h+='<circle class="base" cx="150" cy="150" r="'+r+'" stroke-width="'+W+'"/><circle class="on" cx="150" cy="150" r="'+r+'" stroke-width="'+W+'"/>';
+    h+='<circle class="base" cx="150" cy="150" r="'+r+'" stroke-width="'+W+'"/><circle class="okring" cx="150" cy="150" r="'+r+'" stroke-width="'+W+'"/>';
     (daySlots(q,vk)||[]).forEach(function(x,i){
       var st=(animQ&&animQ!==q)?" static":"",parts=(x.e-x.s>=1440)?[[x.s,x.s+720],[x.s+720,x.e]]:[[x.s,x.e]];
       parts.forEach(function(p){h+='<path class="arc '+x.t+st+'" pathLength="1" stroke-width="'+W+'" style="animation-delay:'+(k*.12+i*.15)+'s" d="'+arc(p[0],p[1],r)+'"/>'});
     });
     h+='<text class="lbl" x="150" y="'+(150-r)+'" text-anchor="middle" dy=".35em">'+q+'</text>';
-    h+='<circle class="mark" cx="150" cy="'+(150-r)+'" r="5.5"/>';
   });
-  h+='<line class="tick" id="tick" x1="150" y1="'+(150-R0-12)+'" x2="150" y2="'+(150-R0-7)+'"/>';
+  // стрілка поточного часу: трикутник ззовні кільця + тонка лінія через усі кільця (обертається в tick())
+  var inner=R0-(Math.max(sel.length,1)-1)*STEP-W/2;
+  h+='<g id="hand"><line class="hl-b" x1="150" y1="'+(150-E)+'" x2="150" y2="'+(150-inner)+'"/>'+
+     '<line class="hl" x1="150" y1="'+(150-E)+'" x2="150" y2="'+(150-inner)+'"/>'+
+     '<path class="hp" d="M150 '+(150-E-1)+'L144 '+(150-E-13)+'L156 '+(150-E-13)+'Z"/></g>';
   $("svg").innerHTML=h;
   $("svg").setAttribute("class",view==="tomorrow"?"tm":"");
-  var inner=R0-(Math.max(sel.length,1)-1)*STEP-W/2-8;
-  $("center").style.width=(inner*2/300*100)+"%";
+  $("center").style.width=((inner-8)*2/360*100)+"%";
 }
 function renderChips(){
   $("chips").innerHTML=QS.map(function(q){
@@ -185,8 +202,7 @@ function upd(){
 }
 function tick(){
   var n=nowMin(),rot="rotate("+(n/1440*360)+" 150 150)";
-  var tk=$("tick");if(tk)tk.setAttribute("transform",rot);
-  var ms=document.querySelectorAll(".mark");for(var i=0;i<ms.length;i++)ms[i].setAttribute("transform",rot);
+  var hd=$("hand");if(hd)hd.setAttribute("transform",rot);
   var k0=kyiv();$("now").textContent=pad(k0.hour)+":"+pad(k0.minute)+":"+pad(k0.second);
   liveUi();
   var kk=keyOf();if(api&&lastKey&&kk!==lastKey){lastKey=kk;animQ=null;segUi();setDate();drawRings();$("list").dataset.k="";}

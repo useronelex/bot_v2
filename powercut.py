@@ -36,6 +36,7 @@ PHRASES_ENABLED = os.environ.get("POWERCUT_PHRASES", "1") == "1"
 GRAPH_PHRASE_CHANCE = float(os.environ.get("POWERCUT_GRAPH_PHRASE_CHANCE") or "1")  # 0..1: як часто фраза перед /graph
 PAGE_URL = os.environ.get("POWERCUT_PAGE_URL", "https://bot-v2-n8wt.onrender.com/schedule")
 MINIAPP_URL = os.environ.get("POWERCUT_MINIAPP_URL", "")  # https://t.me/<бот>/<короткa_назва> — для кнопки в групах
+BUTTON_ENABLED = os.environ.get("POWERCUT_BUTTON", "1") == "1"  # кнопка "Відкрити графік" під повідомленнями з графіком
 PAGE_MSG_TTL = int(os.environ.get("POWERCUT_PAGE_TTL") or "60")  # через скільки сек. прибрати повідомлення з кнопкою (0 = не прибирати)
 PHRASES_PATH = os.environ.get(
     "POWERCUT_PHRASES_PATH",
@@ -180,8 +181,10 @@ def _t(x: int) -> str:
 
 
 def _fmt(intervals: list[list[int]] | None) -> str:
-    if not intervals:
+    if intervals is None:
         return "—"
+    if not intervals:
+        return "відключень немає"
     return ", ".join(f"{_t(s)}–{_t(e)}" for s, e in intervals)
 
 
@@ -203,6 +206,27 @@ def fmt_changed(d: date, old: dict, new: dict, diff: list[str]) -> str:
     if same:
         lines.append("Без змін: " + ", ".join(same))
     return "\n".join(lines).strip()
+
+
+# ──────────────────────────────────────────
+# МИНУЛЕ НЕ ВАЖЛИВЕ: порівнюємо лише те, що ще не відбулося
+# ──────────────────────────────────────────
+def _cmp(intervals, d: date, today: date, now_min: int):
+    """Для порівняння: сьогодні — лише від поточної хвилини, майбутні дні — повністю."""
+    if intervals is None:
+        return []
+    if d > today:
+        return [list(x) for x in intervals]
+    return [[max(s, now_min), e] for s, e in intervals if e > now_min]
+
+
+def _not_past(intervals, d: date, today: date, now_min: int):
+    """Для показу: відкидаємо лише інтервали, що повністю закінчилися (триваючі лишаємо цілими)."""
+    if intervals is None:
+        return None
+    if d > today:
+        return [list(x) for x in intervals]
+    return [list(x) for x in intervals if x[1] > now_min]
 
 
 # ──────────────────────────────────────────
@@ -316,10 +340,22 @@ async def _fetch_texts(client: httpx.AsyncClient) -> list[str]:
     return [t for t, _ in await _fetch_messages(client)]
 
 
-async def _send(bot: Bot, chat_id: int, text: str) -> bool:
+def _page_markup(private: bool):
+    """Кнопка «Відкрити графік»: у приваті — міні-застосунок, у групах (Telegram не дозволяє web_app) — посилання."""
+    if not BUTTON_ENABLED:
+        return None
+    label = "📊 Відкрити графік"
+    if private:
+        btn = InlineKeyboardButton(label, web_app=WebAppInfo(url=PAGE_URL))
+    else:
+        btn = InlineKeyboardButton(label, url=MINIAPP_URL or PAGE_URL)
+    return InlineKeyboardMarkup([[btn]])
+
+
+async def _send(bot: Bot, chat_id: int, text: str, reply_markup=None) -> bool:
     for _ in range(3):
         try:
-            sent = await bot.send_message(chat_id=chat_id, text=text)
+            sent = await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
             _record(chat_id, sent.message_id)
             return True
         except RetryAfter as e:
@@ -331,7 +367,10 @@ async def _send(bot: Bot, chat_id: int, text: str) -> bool:
     return False
 
 
-async def _process(bot: Bot, texts: list[str], state: dict, today: date) -> None:
+async def _process(bot: Bot, texts: list[str], state: dict, today: date, now_min: int | None = None) -> None:
+    if now_min is None:
+        kn = _now_kyiv()
+        now_min = kn.hour * 60 + kn.minute
     schedules: dict = state["schedules"]
 
     for k in list(schedules):  # прибираємо минулі дні
@@ -355,14 +394,34 @@ async def _process(bot: Bot, texts: list[str], state: dict, today: date) -> None
                 schedules[key] = queues
                 dirty = True
                 continue
-            msg = fmt_new(d, queues)
+            shown = {q: _not_past(iv, d, today, now_min) for q, iv in queues.items()}
+            if not any(shown.values()):  # увесь графік уже в минулому — просто запам'ятовуємо
+                schedules[key] = queues
+                dirty = True
+                continue
+            msg = fmt_new(d, shown)
             event = "new_schedule"
         else:
-            diff = [q for q in QUEUES if q in queues and old.get(q) != queues[q]]
+            diff = [
+                q for q in QUEUES
+                if q in queues and _cmp(old.get(q), d, today, now_min) != _cmp(queues[q], d, today, now_min)
+            ]
             if not diff:
+                # змінилося лише минуле (або нічого) — тихо оновлюємо збережені дані, без сповіщення
+                merged = {**old, **queues}
+                if merged != old:
+                    schedules[key] = merged
+                    dirty = True
                 continue
-            msg = fmt_changed(d, old, queues, diff)
-            event = classify_change(old, queues, diff)
+            names = [q for q in QUEUES if q in old or q in queues]
+            old_show = {q: _not_past(old.get(q), d, today, now_min) for q in names}
+            new_show = {q: _not_past(queues.get(q, old.get(q)), d, today, now_min) for q in names}
+            msg = fmt_changed(d, old_show, new_show, diff)
+            event = classify_change(
+                {q: _cmp(old.get(q), d, today, now_min) for q in names},
+                {q: _cmp(queues.get(q, old.get(q)), d, today, now_min) for q in names},
+                diff,
+            )
 
         # 1) окреме повідомлення з фразою, 2) сам графік
         if PHRASES_ENABLED and msg not in _phrased:
@@ -371,7 +430,7 @@ async def _process(bot: Bot, texts: list[str], state: dict, today: date) -> None
                 _phrased.add(msg)
                 await asyncio.sleep(1)
 
-        if await _send(bot, CHAT_ID, msg):
+        if await _send(bot, CHAT_ID, msg, _page_markup(CHAT_ID > 0)):
             logger.info(f"Надіслано сповіщення про графік на {key} ({event})")
             _phrased.discard(msg)
             schedules[key] = {**(old or {}), **queues}
@@ -449,7 +508,9 @@ async def cmd_graph(update, context) -> None:
                 await asyncio.sleep(1)
             except Exception as e:
                 logger.warning(f"/graph: не вдалося надіслати фразу: {e}")
-    sent = await context.bot.send_message(chat_id=chat_id, text=text)
+    chat = update.effective_chat
+    markup = _page_markup(chat is not None and chat.type == "private")
+    sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
     _record(chat_id, sent.message_id)
 
 
@@ -553,7 +614,8 @@ async def _monitor(bot: Bot) -> None:
                 if alerted and ADMIN_USER_ID:
                     await _send(bot, ADMIN_USER_ID, "✅ Моніторинг каналу відновлено.")
                 alerted = False
-                await _process(bot, texts, state, _now_kyiv().date())
+                kn = _now_kyiv()
+                await _process(bot, texts, state, kn.date(), kn.hour * 60 + kn.minute)
             except asyncio.CancelledError:
                 raise
             except _RateLimited as e:

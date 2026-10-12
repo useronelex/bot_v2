@@ -32,16 +32,10 @@ QUEUES = tuple(q.strip() for q in os.environ.get("POWERCUT_QUEUES", "1.1,2.1,3.1
 POLL_INTERVAL = max(5.0, float(os.environ.get("POWERCUT_POLL_SEC") or "10"))
 STATE_PATH = os.environ.get("POWERCUT_STATE_PATH", "powercut_state.json")
 NOTIFY_ON_FIRST_RUN = os.environ.get("POWERCUT_NOTIFY_FIRST_RUN", "0") == "1"
-PHRASES_ENABLED = os.environ.get("POWERCUT_PHRASES", "1") == "1"
-GRAPH_PHRASE_CHANCE = float(os.environ.get("POWERCUT_GRAPH_PHRASE_CHANCE") or "0")  # 0..1: як часто фраза перед /graph
 PAGE_URL = os.environ.get("POWERCUT_PAGE_URL", "https://bot-v2-n8wt.onrender.com/schedule")
 MINIAPP_URL = os.environ.get("POWERCUT_MINIAPP_URL", "")  # https://t.me/<бот>/<короткa_назва> — для кнопки в групах
 BUTTON_ENABLED = os.environ.get("POWERCUT_BUTTON", "1") == "1"  # кнопка "Відкрити графік" під повідомленнями з графіком
 PAGE_MSG_TTL = int(os.environ.get("POWERCUT_PAGE_TTL") or "60")  # через скільки сек. прибрати повідомлення з кнопкою (0 = не прибирати)
-PHRASES_PATH = os.environ.get(
-    "POWERCUT_PHRASES_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "phrases.json"),
-)
 ALERT_AFTER_SEC = 300  # якщо канал недоступний стільки часів поспіль — сповістити адміна
 
 URL = f"https://t.me/s/{CHANNEL}"
@@ -208,6 +202,21 @@ def fmt_changed(d: date, old: dict, new: dict, diff: list[str]) -> str:
     return "\n".join(lines).strip()
 
 
+def _total(intervals: list[list[int]] | None) -> int:
+    return sum(e - s for s, e in intervals or [])
+
+
+def classify_change(old: dict, new: dict, diff: list[str]) -> str:
+    """Тип зміни: відключень стало більше / менше / стільки ж, але в інший час."""
+    before = sum(_total(old.get(q)) for q in diff)
+    after = sum(_total(new.get(q)) for q in diff)
+    if after > before:
+        return "changed_worse"
+    if after < before:
+        return "changed_better"
+    return "changed_shifted"
+
+
 # ──────────────────────────────────────────
 # МИНУЛЕ НЕ ВАЖЛИВЕ: порівнюємо лише те, що ще не відбулося
 # ──────────────────────────────────────────
@@ -227,46 +236,6 @@ def _not_past(intervals, d: date, today: date, now_min: int):
     if d > today:
         return [list(x) for x in intervals]
     return [list(x) for x in intervals if x[1] > now_min]
-
-
-# ──────────────────────────────────────────
-# ФРАЗИ ПЕРЕД ГРАФІКОМ
-# ──────────────────────────────────────────
-_last_phrase: dict[str, str] = {}
-_phrased: set[str] = set()  # сповіщення, для яких фразу вже надіслано (щоб не дублювати при повторі)
-
-
-def _total(intervals: list[list[int]] | None) -> int:
-    return sum(e - s for s, e in intervals or [])
-
-
-def classify_change(old: dict, new: dict, diff: list[str]) -> str:
-    """Тип зміни: відключень стало більше / менше / стільки ж, але в інший час."""
-    before = sum(_total(old.get(q)) for q in diff)
-    after = sum(_total(new.get(q)) for q in diff)
-    if after > before:
-        return "changed_worse"
-    if after < before:
-        return "changed_better"
-    return "changed_shifted"
-
-
-def pick_phrase(event: str) -> str | None:
-    """Випадкова фраза для події з phrases.json (файл перечитується щоразу, тож правки діють без перезапуску)."""
-    try:
-        with open(PHRASES_PATH, encoding="utf-8") as f:
-            data = json.load(f)
-        data = data.get("blackout_responses", data)
-        items = [x for x in (data.get(event) or []) if isinstance(x, str) and x.strip()]
-    except Exception as e:
-        logger.warning(f"Не вдалося прочитати {PHRASES_PATH}: {e}")
-        return None
-    if not items:
-        return None
-    last = _last_phrase.get(event)
-    phrase = random.choice([x for x in items if x != last] or items)
-    _last_phrase[event] = phrase
-    return phrase
 
 
 # ──────────────────────────────────────────
@@ -423,16 +392,8 @@ async def _process(bot: Bot, texts: list[str], state: dict, today: date, now_min
                 diff,
             )
 
-        # 1) окреме повідомлення з фразою, 2) сам графік
-        if PHRASES_ENABLED and msg not in _phrased:
-            phrase = pick_phrase(event)
-            if phrase and await _send(bot, CHAT_ID, phrase):
-                _phrased.add(msg)
-                await asyncio.sleep(1)
-
         if await _send(bot, CHAT_ID, msg, _page_markup(CHAT_ID > 0)):
             logger.info(f"Надіслано сповіщення про графік на {key} ({event})")
-            _phrased.discard(msg)
             schedules[key] = {**(old or {}), **queues}
             dirty = True
         else:
@@ -498,16 +459,6 @@ async def cmd_graph(update, context) -> None:
         logger.error(f"/graph: {e}")
         await _notice(context.bot, chat_id, "Не вдалося отримати графік, спробуйте за хвилину.")
         return
-    # фраза для того, хто натиснув /graph (окремим повідомленням), потім сам графік
-    if PHRASES_ENABLED and random.random() < GRAPH_PHRASE_CHANCE:
-        phrase = pick_phrase("graph_called")
-        if phrase:
-            try:
-                p_msg = await context.bot.send_message(chat_id=chat_id, text=phrase)
-                _record(chat_id, p_msg.message_id)
-                await asyncio.sleep(1)
-            except Exception as e:
-                logger.warning(f"/graph: не вдалося надіслати фразу: {e}")
     chat = update.effective_chat
     markup = _page_markup(chat is not None and chat.type == "private")
     sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)

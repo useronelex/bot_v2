@@ -1,6 +1,27 @@
 """
 powercut.py — незалежний моніторинг графіків відключень світла.
 
+Читає публічну веб-версію Telegram-каналу (https://t.me/s/<канал>), витягує графіки
+для заданих черг і надсилає в чат повідомлення ЛИШЕ коли графік з'явився або змінився.
+
+Працює у власному потоці зі своїм event loop і своїм екземпляром Bot, тому:
+  * не залежить від bot.py (yt-dlp, Instagram, ffprobe тощо);
+  * сам перезапускається після будь-якої помилки;
+  * його легко винести в окремий сервіс:  python powercut.py
+
+ENV:
+  BOT_TOKEN              — токен бота (обов'язково)
+  POWERCUT_CHAT_ID       — ID групи (за замовчуванням -1002257349628)
+  ADMIN_USER_ID          — (необов'язково) куди слати аварійні сповіщення
+  POWERCUT_CHANNEL       — канал (за замовчуванням pat_cherkasyoblenergo)
+  POWERCUT_QUEUES        — черги, які бот показує в групах і користувачам, через кому (за замовчуванням 1.1,2.1,3.1); парситься кожна черга
+  POWERCUT_POLL_SEC      — інтервал опитування, сек (за замовчуванням 10, мінімум 5)
+  POWERCUT_STATE_PATH    — файл стану (за замовчуванням powercut_state.json)
+  POWERCUT_NOTIFY_FIRST_RUN=1 — при порожньому стані одразу надіслати поточні графіки
+  POWERCUT_MINIAPP_URL   — посилання на міні-застосунок (https://t.me/бот/назва) для кнопки /web у групах
+  POWERCUT_PHRASES=0     — вимкнути фрази перед графіком (файл phrases.json поруч із цим модулем)
+  POWERCUT_BUTTON=0      — не додавати кнопку «Відкрити графік» під повідомлення з графіком
+  POWERCUT_GRAPH_PHRASE_CHANCE — імовірність фрази перед /graph, 0..1 (за замовчуванням 1)
 """
 
 import asyncio
@@ -28,14 +49,23 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID = int(os.environ.get("POWERCUT_CHAT_ID"))
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID") or "0")
 CHANNEL = os.environ.get("POWERCUT_CHANNEL", "pat_cherkasyoblenergo")
-QUEUES = tuple(q.strip() for q in os.environ.get("POWERCUT_QUEUES", "1.1,2.1,3.1").split(",") if q.strip())
+# Бот парсить УСІ черги (для сторінки), а в групи й користувачам (сповіщення, /graph) виводить лише ці.
+# Змінити можна тут або змінною POWERCUT_QUEUES на Render, напр.: 1.1,2.1,3.1,4.2
+DISPLAY_QUEUES = ["1.1", "2.1", "3.1"]
+QUEUES = tuple(q.strip() for q in os.environ.get("POWERCUT_QUEUES", ",".join(DISPLAY_QUEUES)).split(",") if q.strip())
 POLL_INTERVAL = max(5.0, float(os.environ.get("POWERCUT_POLL_SEC") or "10"))
 STATE_PATH = os.environ.get("POWERCUT_STATE_PATH", "powercut_state.json")
 NOTIFY_ON_FIRST_RUN = os.environ.get("POWERCUT_NOTIFY_FIRST_RUN", "0") == "1"
+PHRASES_ENABLED = os.environ.get("POWERCUT_PHRASES", "1") == "1"
+# GRAPH_PHRASE_CHANCE = float(os.environ.get("POWERCUT_GRAPH_PHRASE_CHANCE") or "1")  # 0..1: як часто фраза перед /graph
 PAGE_URL = os.environ.get("POWERCUT_PAGE_URL", "https://bot-v2-n8wt.onrender.com/schedule")
 MINIAPP_URL = os.environ.get("POWERCUT_MINIAPP_URL", "")  # https://t.me/<бот>/<короткa_назва> — для кнопки в групах
 BUTTON_ENABLED = os.environ.get("POWERCUT_BUTTON", "1") == "1"  # кнопка "Відкрити графік" під повідомленнями з графіком
 PAGE_MSG_TTL = int(os.environ.get("POWERCUT_PAGE_TTL") or "60")  # через скільки сек. прибрати повідомлення з кнопкою (0 = не прибирати)
+PHRASES_PATH = os.environ.get(
+    "POWERCUT_PHRASES_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "phrases.json"),
+)
 ALERT_AFTER_SEC = 300  # якщо канал недоступний стільки часів поспіль — сповістити адміна
 
 URL = f"https://t.me/s/{CHANNEL}"
@@ -132,7 +162,7 @@ def parse_message(text: str, today: date) -> tuple[date, dict[str, list[list[int
     queues: dict[str, list[list[int]]] = {}
     for line in text.splitlines():
         m = _QUEUE_LINE.match(line)
-        if not m or m.group(1) not in QUEUES:
+        if not m:
             continue
         pairs = []
         for h1, m1, h2, m2 in _INTERVAL.findall(m.group(2)):
@@ -202,21 +232,6 @@ def fmt_changed(d: date, old: dict, new: dict, diff: list[str]) -> str:
     return "\n".join(lines).strip()
 
 
-def _total(intervals: list[list[int]] | None) -> int:
-    return sum(e - s for s, e in intervals or [])
-
-
-def classify_change(old: dict, new: dict, diff: list[str]) -> str:
-    """Тип зміни: відключень стало більше / менше / стільки ж, але в інший час."""
-    before = sum(_total(old.get(q)) for q in diff)
-    after = sum(_total(new.get(q)) for q in diff)
-    if after > before:
-        return "changed_worse"
-    if after < before:
-        return "changed_better"
-    return "changed_shifted"
-
-
 # ──────────────────────────────────────────
 # МИНУЛЕ НЕ ВАЖЛИВЕ: порівнюємо лише те, що ще не відбулося
 # ──────────────────────────────────────────
@@ -236,6 +251,46 @@ def _not_past(intervals, d: date, today: date, now_min: int):
     if d > today:
         return [list(x) for x in intervals]
     return [list(x) for x in intervals if x[1] > now_min]
+
+
+# ──────────────────────────────────────────
+# ФРАЗИ ПЕРЕД ГРАФІКОМ
+# ──────────────────────────────────────────
+_last_phrase: dict[str, str] = {}
+_phrased: set[str] = set()  # сповіщення, для яких фразу вже надіслано (щоб не дублювати при повторі)
+
+
+def _total(intervals: list[list[int]] | None) -> int:
+    return sum(e - s for s, e in intervals or [])
+
+
+def classify_change(old: dict, new: dict, diff: list[str]) -> str:
+    """Тип зміни: відключень стало більше / менше / стільки ж, але в інший час."""
+    before = sum(_total(old.get(q)) for q in diff)
+    after = sum(_total(new.get(q)) for q in diff)
+    if after > before:
+        return "changed_worse"
+    if after < before:
+        return "changed_better"
+    return "changed_shifted"
+
+
+def pick_phrase(event: str) -> str | None:
+    """Випадкова фраза для події з phrases.json (файл перечитується щоразу, тож правки діють без перезапуску)."""
+    try:
+        with open(PHRASES_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        data = data.get("blackout_responses", data)
+        items = [x for x in (data.get(event) or []) if isinstance(x, str) and x.strip()]
+    except Exception as e:
+        logger.warning(f"Не вдалося прочитати {PHRASES_PATH}: {e}")
+        return None
+    if not items:
+        return None
+    last = _last_phrase.get(event)
+    phrase = random.choice([x for x in items if x != last] or items)
+    _last_phrase[event] = phrase
+    return phrase
 
 
 # ──────────────────────────────────────────
@@ -363,7 +418,7 @@ async def _process(bot: Bot, texts: list[str], state: dict, today: date, now_min
                 schedules[key] = queues
                 dirty = True
                 continue
-            shown = {q: _not_past(iv, d, today, now_min) for q, iv in queues.items()}
+            shown = {q: _not_past(iv, d, today, now_min) for q, iv in queues.items() if q in QUEUES}
             if not any(shown.values()):  # увесь графік уже в минулому — просто запам'ятовуємо
                 schedules[key] = queues
                 dirty = True
@@ -392,8 +447,16 @@ async def _process(bot: Bot, texts: list[str], state: dict, today: date, now_min
                 diff,
             )
 
+        # 1) окреме повідомлення з фразою, 2) сам графік
+        if PHRASES_ENABLED and msg not in _phrased:
+            phrase = pick_phrase(event)
+            if phrase and await _send(bot, CHAT_ID, phrase):
+                _phrased.add(msg)
+                await asyncio.sleep(1)
+
         if await _send(bot, CHAT_ID, msg, _page_markup(CHAT_ID > 0)):
             logger.info(f"Надіслано сповіщення про графік на {key} ({event})")
+            _phrased.discard(msg)
             schedules[key] = {**(old or {}), **queues}
             dirty = True
         else:
@@ -418,7 +481,11 @@ async def current_schedules_text() -> str:
         async with httpx.AsyncClient(headers=headers, timeout=15, follow_redirects=True) as client:
             texts = await _fetch_texts(client)
     today = _now_kyiv().date()
-    current = {d: q for d, q in build_current(texts, today).items() if d >= today}
+    current = {}
+    for d, qs in build_current(texts, today).items():
+        shown = {q: iv for q, iv in qs.items() if q in QUEUES}
+        if d >= today and shown:
+            current[d] = shown
     if not current:
         return "Актуальних графіків для черг " + ", ".join(QUEUES) + " у каналі не знайдено."
     return "\n\n".join(fmt_new(d, q, "📋 Поточний графік на") for d, q in sorted(current.items()))
@@ -459,6 +526,16 @@ async def cmd_graph(update, context) -> None:
         logger.error(f"/graph: {e}")
         await _notice(context.bot, chat_id, "Не вдалося отримати графік, спробуйте за хвилину.")
         return
+    # фраза для того, хто натиснув /graph (окремим повідомленням), потім сам графік
+    if PHRASES_ENABLED and random.random() < GRAPH_PHRASE_CHANCE:
+        phrase = pick_phrase("graph_called")
+        if phrase:
+            try:
+                p_msg = await context.bot.send_message(chat_id=chat_id, text=phrase)
+                _record(chat_id, p_msg.message_id)
+                await asyncio.sleep(1)
+            except Exception as e:
+                logger.warning(f"/graph: не вдалося надіслати фразу: {e}")
     chat = update.effective_chat
     markup = _page_markup(chat is not None and chat.type == "private")
     sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
@@ -645,6 +722,10 @@ def _ms(ts: float | None) -> int | None:
     return int(ts * 1000) if ts else None
 
 
+def _qkey(q: str) -> tuple:
+    return tuple(int(x) for x in q.split("."))
+
+
 def build_api(current: dict, times: dict, today: date, checked_at: float | None) -> dict:
     days: dict = {}
     for d, qs in sorted(current.items()):
@@ -657,9 +738,11 @@ def build_api(current: dict, times: dict, today: date, checked_at: float | None)
             }
             for q, iv in qs.items()
         }
+    found = {q for qs in days.values() for q in qs}
     return {
         "today": today.isoformat(),
-        "queues": list(QUEUES),
+        "queues": sorted(set(QUEUES) | found, key=_qkey),
+        "displayQueues": list(QUEUES),
         "days": days,
         "checkedAt": _ms(checked_at),
         "pollSec": POLL_INTERVAL,
@@ -688,7 +771,7 @@ def _publish_api_from_state(state: dict) -> None:
 def api_data() -> dict:
     data = _api["data"]
     out = dict(data) if data else {
-        "today": _now_kyiv().date().isoformat(), "queues": list(QUEUES), "days": {},
+        "today": _now_kyiv().date().isoformat(), "queues": sorted(QUEUES, key=_qkey), "displayQueues": list(QUEUES), "days": {},
         "checkedAt": None, "pollSec": POLL_INTERVAL,
     }
     out["ready"] = bool(data)

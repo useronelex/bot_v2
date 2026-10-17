@@ -1,8 +1,3 @@
-"""
-powercut.py — незалежний моніторинг графіків відключень світла.
-
-"""
-
 import asyncio
 import json
 import logging
@@ -523,7 +518,9 @@ async def cmd_web(update, context) -> None:
 # ГОЛОВНИЙ ЦИКЛ
 # ──────────────────────────────────────────
 async def _monitor(bot: Bot) -> None:
+    global _state_ref
     state = _load_state()
+    _state_ref = state
     _publish_api_from_state(state)
     fails = 0
     fail_since: float | None = None
@@ -625,6 +622,31 @@ def start_in_background() -> None:
 # ДАНІ ДЛЯ ВЕБ-СТОРІНКИ (/api/schedule)
 # ──────────────────────────────────────────
 _api: dict = {"data": None}
+_state_ref: dict | None = None  # посилання на стан моніторингу (тут зберігаємо історію минулих інтервалів)
+
+
+def _remember_past(today: date, now_min: int, current: dict) -> dict:
+    """Якщо канал прибрав інтервал, який уже закінчився, — лишаємо його в історії (для кола на сторінці).
+    Інтервали, прибрані до свого завершення (справжня зміна графіка), НЕ зберігаються."""
+    st = _state_ref
+    if st is None:
+        return {}
+    hist = st.setdefault("hist", {})
+    key = today.isoformat()
+    for k in [k for k in hist if k < key]:
+        del hist[k]
+    prev = st.get("schedules", {}).get(key) or {}
+    new = current.get(today, {})
+    h = hist.setdefault(key, {})
+    changed = False
+    for q, ivs in prev.items():
+        for iv in ivs:
+            if iv[1] <= now_min and iv not in new.get(q, []) and iv not in h.setdefault(q, []):
+                h[q].append(list(iv))
+                changed = True
+    if changed:
+        _save_state(st)
+    return h
 
 
 def _ms(ts: float | None) -> int | None:
@@ -635,7 +657,7 @@ def _qkey(q: str) -> tuple:
     return tuple(int(x) for x in q.split("."))
 
 
-def build_api(current: dict, times: dict, today: date, checked_at: float | None) -> dict:
+def build_api(current: dict, times: dict, today: date, checked_at: float | None, hist: dict | None = None) -> dict:
     days: dict = {}
     for d, qs in sorted(current.items()):
         if d < today or d > today + timedelta(days=2):
@@ -647,6 +669,13 @@ def build_api(current: dict, times: dict, today: date, checked_at: float | None)
             }
             for q, iv in qs.items()
         }
+    if hist:  # інтервали, що вже відбулись, але яких канал більше не публікує (він обрізає минулі години)
+        day = days.setdefault(today.isoformat(), {})
+        for q, ivs in hist.items():
+            rec = day.setdefault(q, {"slots": [], "updatedAt": None})
+            have = {(x["s"], x["e"]) for x in rec["slots"]}
+            rec["slots"] += [{"s": a, "e": b, "t": "off"} for a, b in ivs if (a, b) not in have]
+            rec["slots"].sort(key=lambda x: x["s"])
     found = {q for qs in days.values() for q in qs}
     return {
         "today": today.isoformat(),
@@ -660,9 +689,11 @@ def build_api(current: dict, times: dict, today: date, checked_at: float | None)
 
 def _publish_api(msgs: list[tuple[str, float | None]]) -> None:
     try:
-        today = _now_kyiv().date()
+        kn = _now_kyiv()
+        today = kn.date()
         current, times = build_current_ts(msgs, today)
-        _api["data"] = build_api(current, times, today, time.time())
+        hist = _remember_past(today, kn.hour * 60 + kn.minute, current)
+        _api["data"] = build_api(current, times, today, time.time(), hist)
     except Exception as e:
         logger.warning(f"Не вдалося оновити дані для веб-сторінки: {e}")
 
@@ -672,7 +703,7 @@ def _publish_api_from_state(state: dict) -> None:
     try:
         today = _now_kyiv().date()
         current = {date.fromisoformat(k): v for k, v in state.get("schedules", {}).items()}
-        _api["data"] = build_api(current, {}, today, None)
+        _api["data"] = build_api(current, {}, today, None, state.get("hist", {}).get(today.isoformat()))
     except Exception as e:
         logger.warning(f"Не вдалося підготувати дані зі стану: {e}")
 

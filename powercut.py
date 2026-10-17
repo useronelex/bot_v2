@@ -139,6 +139,8 @@ def parse_message(text: str, today: date) -> tuple[date, dict[str, list[list[int
                 start, end = h1 * 60 + m1, h2 * 60 + m2
                 if end == 0 and start > 0:  # "23:00 - 00:00" → кінець о півночі
                     end = 1440
+                elif 0 < end < start:  # інтервал через північ ("22:00 - 02:00"): на цю добу рахуємо до 24:00
+                    end = 1440
                 pairs.append([start, end])
         if pairs:
             queues.setdefault(m.group(1), []).extend(pairs)

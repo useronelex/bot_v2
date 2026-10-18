@@ -1,0 +1,30 @@
+services:
+  bot:
+    build: .
+    container_name: bot_v2
+    restart: unless-stopped
+    environment:
+      TZ: Europe/Kyiv
+      BOT_TOKEN: ${BOT_TOKEN}
+      WEBHOOK_URL: ${WEBHOOK_URL}
+      ADMIN_USER_ID: ${ADMIN_USER_ID}
+      POWERCUT_CHAT_ID: ${POWERCUT_CHAT_ID}
+      POWERCUT_PAGE_URL: ${POWERCUT_PAGE_URL}
+      INSTAGRAM_COOKIES: ${INSTAGRAM_COOKIES}
+    volumes:
+      - bot_data:/data
+    expose:
+      - "10000"
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: bot_tunnel
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - bot
+
+volumes:
+  bot_data:

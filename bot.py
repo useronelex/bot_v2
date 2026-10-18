@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID") or "0")
-INSTAGRAM_COOKIES_RAW = os.environ.get("INSTAGRAM_COOKIES", "")
+INSTAGRAM_COOKIES_RAW = os.environ.get("INSTAGRAM_COOKIES", "").replace("\\n", "\n").replace("\\t", "\t")
 _COOKIES_FILE: str | None = None
 
 REQUEST_LIMIT = 50

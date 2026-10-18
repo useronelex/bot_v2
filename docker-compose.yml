@@ -1,6 +1,7 @@
 services:
   bot:
     build: .
+    pull_policy: build
     container_name: bot_v2
     restart: unless-stopped
     environment:

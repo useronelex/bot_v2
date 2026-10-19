@@ -101,8 +101,6 @@ function scale(){
   }
   return h;
 }
-// «Сьогодні»: відключення завтрашньої доби, що по колу настають ПІСЛЯ стрілки (їх час на циферблаті < поточного)
-function wrapRaw(q){if(view!=="today")return[];var nm=nowMin();return(daySlots(q,addDay(keyOf(),1))||[]).filter(function(x){return x.s<nm})}
 function arcP(a,b,cls,dl,r,W,st){return'<path class="arc off '+cls+st+'" pathLength="1" stroke-width="'+W+'" style="animation-delay:'+dl+'s" d="'+arc(a,b,r)+'"/>'}
 function drawRings(){
   var g=geo(sel.length||1),W=g.W,R0=g.R0,STEP=g.STEP,h=defs()+scale(),vk=viewKey(),E=OUT,nm=view==='today'?nowMin():-1;
@@ -120,7 +118,6 @@ function drawRings(){
         else h+=arcP(a,b,(nm>=0&&b<=nm)?"past":"",dl,r,W,st);
       });
     });
-    wrapRaw(q).forEach(function(x,i){h+=arcP(x.s,Math.min(x.e,nm),"nx",k*.12+i*.15,r-W*.29,W*.42,st)});   // смужка «завтра»
     h+='<text class="lbl" x="150" y="'+(150-r)+'" text-anchor="middle" dy=".35em" style="font-size:'+Math.min(10,W-2.5)+'px">'+q+'</text>';
   });
   // стрілка поточного часу: трикутник ззовні кільця + тонка лінія через усі кільця (обертається в tick())
@@ -166,18 +163,16 @@ function upd(){
   $("upd").textContent=m?"Останній графік у каналі опубліковано о "+hhmm(m):"";
 }
 function subText(q,vk){
-  var sl=daySlots(q,vk),r=dayRec(q,vk),txt,w=wrapRaw(q);
+  var sl=daySlots(q,vk),r=dayRec(q,vk),txt;
   if(sl===null)txt="немає даних на цей день";
   else if(!sl.length)txt="відключень немає";
   else txt=sl.slice().sort(function(a,b){return a.s-b.s}).map(function(x){return hm(x.s)+"–"+hm(x.e)}).join(" · ");
-  if(w.length)txt+=" · завтра "+w.map(function(x){return hm(x.s)+"–"+hm(x.e)}).join(", ");
   if(r&&r.updatedAt)txt+=" · оновлено "+hhmm(r.updatedAt);
   return txt;
 }
-function updSubs(){var vk=viewKey();sel.forEach(function(q){var e=document.getElementById("sb-"+q.replace(".",""));if(e){var t=subText(q,vk);if(e.textContent!==t)e.textContent=t}})}
 function tick(){
   var n=nowMin(),rot="rotate("+(n/1440*360)+" 150 150)";
-  var mk=Math.floor(n);if(mk!==lastMin){var f0=lastMin===-1;lastMin=mk;if(!f0&&api&&sel.length&&view==="today"){animQ="-";drawRings();updSubs();rot="rotate("+(n/1440*360)+" 150 150)"}}
+  var mk=Math.floor(n);if(mk!==lastMin){var f0=lastMin===-1;lastMin=mk;if(!f0&&api&&sel.length&&view==="today"){animQ="-";drawRings();rot="rotate("+(n/1440*360)+" 150 150)"}}
   var hd=$("hand");if(hd)hd.setAttribute("transform",rot);
   var k0=kyiv();$("now").textContent=pad(k0.hour)+":"+pad(k0.minute)+":"+pad(k0.second);
   liveUi();

@@ -1,13 +1,16 @@
 import os
 import re
+import json
 import logging
 import asyncio
+import subprocess
 import tempfile
 import time
 from collections import deque, defaultdict
 from pathlib import Path
 
 from telegram import Update
+from telegram.error import BadRequest, Forbidden, NetworkError
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 
 logging.basicConfig(
@@ -85,27 +88,12 @@ def _init_cookies() -> None:
 # МЕТОД 1: yt-dlp
 # ──────────────────────────────────────────
 
-def _download_ytdlp(url: str, output_dir: str, platform: str) -> str | None:
+def _download_ytdlp(url: str, output_dir: str) -> str | None:
     import yt_dlp
-    ''' 
-    #Попередній формат
-    fmt = (
-        # H.264 + AAC — оптимально для Telegram
-        "bestvideo[vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]/"
-        # Явно вимагаємо AAC аудіо (оригінальний трек, не замінений)
-        "bestvideo[vcodec^=avc]+bestaudio[acodec^=mp4a]/"
-        "bestvideo[vcodec^=avc]+bestaudio/"
-        "bestvideo+bestaudio/"
-        # Pre-muxed MP4 з аудіо — часто містить оригінальну музику
-        # [acodec!=none] виключає video-only DASH стріми
-        "best[ext=mp4][acodec!=none]/"
-        "best"
-    )
-    '''
     fmt = (
         "bestvideo[vcodec!=unknown]+bestaudio[ext=m4a]/"
         "bestvideo[vcodec!=unknown]+bestaudio/"
-        "best[acodec!=none]"
+        "best[acodec!=none]/"
         "best"
     )
     
@@ -175,14 +163,76 @@ def _download_ytdlp(url: str, output_dir: str, platform: str) -> str | None:
     except Exception as e:
         logger.error(f"yt-dlp Exception: {e}", exc_info=True)
         return None
-        
 
 # ──────────────────────────────────────────
 # DISPATCH
 # ──────────────────────────────────────────
 def download_media(url: str, output_dir: str, platform: str) -> str | None:
     logger.info(f"yt-dlp: {'cookies активні' if _COOKIES_FILE else 'без cookies'} | {platform} | {url}")
-    return _download_ytdlp(url, output_dir, platform)
+    return _download_ytdlp(url, output_dir)
+
+# ──────────────────────────────────────────
+# HELPERS
+# ──────────────────────────────────────────
+_throttle_until: dict[str, float] = {}
+_throttle_skipped: dict[str, int] = {}
+_bg: set[asyncio.Task] = set()
+
+
+def throttled(key: str, interval: float = 60.0) -> int | None:
+    """None — подію слід пропустити (недавно вже була); інакше — скільки однакових подій пропущено досі."""
+    now = time.monotonic()
+    if len(_throttle_until) > 200:  # не даємо словнику рости
+        for k in [k for k, t in _throttle_until.items() if t < now]:
+            del _throttle_until[k]
+    if now < _throttle_until.get(key, 0):
+        _throttle_skipped[key] = _throttle_skipped.get(key, 0) + 1
+        return None
+    _throttle_until[key] = now + interval
+    return _throttle_skipped.pop(key, 0)
+
+
+def _more(n: int) -> str:
+    return f" (+{n} подібних)" if n else ""
+
+
+async def _reply_temp(message, text: str, ttl: float = 5) -> None:
+    """Коротка службова відповідь, що сама зникає (хендлер не чекає)."""
+    try:
+        notice = await message.reply_text(text, reply_to_message_id=message.message_id)
+    except Exception as e:
+        logger.warning(f"Не вдалося надіслати службову відповідь: {e}")
+        return
+
+    async def _drop() -> None:
+        await asyncio.sleep(ttl)
+        try:
+            await notice.delete()
+        except Exception:
+            pass
+
+    task = asyncio.create_task(_drop())
+    _bg.add(task)
+    task.add_done_callback(_bg.discard)
+
+
+def _probe(path: str) -> tuple[int | None, int | None, int | None, bool]:
+    """(ширина, висота, тривалість с, є_аудіо) через ffprobe; за збою — порожні значення."""
+    def run(*args: str) -> dict:
+        r = subprocess.run(["ffprobe", "-v", "error", *args, "-of", "json", path],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode:
+            raise RuntimeError(r.stderr.strip()[:100])
+        return json.loads(r.stdout or "{}")
+    try:
+        v = run("-select_streams", "v:0", "-show_entries", "stream=width,height:format=duration")
+        st = (v.get("streams") or [{}])[0]
+        dur = v.get("format", {}).get("duration")
+        a = run("-select_streams", "a:0", "-show_entries", "stream=codec_name")
+        return st.get("width"), st.get("height"), int(float(dur)) if dur else None, bool(a.get("streams"))
+    except Exception as e:
+        logger.debug(f"ffprobe недоступний: {e}")
+        return None, None, None, True  # не заважаємо відправці
 
 # ──────────────────────────────────────────
 # RATE LIMIT
@@ -191,16 +241,18 @@ def check_rate_limit(user_id: int) -> tuple[bool, int]:
     now = time.time()
     cooldown = user_cooldowns.get(user_id, 0)
     if now < cooldown:
-        return False, int((cooldown - now) / 60)
-    if user_id not in user_timestamps:
-        user_timestamps[user_id] = deque()
-    ts = user_timestamps[user_id]
+        return False, int((cooldown - now) / 60) + 1
+    user_cooldowns.pop(user_id, None)
+    ts = user_timestamps.setdefault(user_id, deque())
     while ts and ts[0] < now - REQUEST_WINDOW:
         ts.popleft()
     if len(ts) >= REQUEST_LIMIT:
         user_cooldowns[user_id] = now + COOLDOWN_TIME
         return False, COOLDOWN_TIME // 60
     ts.append(now)
+    if len(user_timestamps) > 500:  # прибираємо неактивних
+        for uid in [u for u, d in user_timestamps.items() if d[-1] < now - REQUEST_WINDOW]:
+            del user_timestamps[uid]
     return True, 0
 
 # ──────────────────────────────────────────
@@ -213,13 +265,15 @@ async def keep_uploading_action(chat_id: int, bot) -> None:
             await asyncio.sleep(4)
     except asyncio.CancelledError:
         pass
+    except Exception:  # індикатор не критичний (напр. бота вилучили з чату)
+        pass
 
 # ──────────────────────────────────────────
 # HANDLER
 # ──────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
-    if not message or not message.text:
+    if not message or not message.text or not message.from_user:
         return
     if time.time() - message.date.timestamp() > 30:
         return
@@ -232,12 +286,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = message.from_user.id
     allowed, cooldown_mins = check_rate_limit(user_id)
     if not allowed:
-        err = await message.reply_text(f"Забагато запитів. Спробуй через {cooldown_mins} хв.")
-        await asyncio.sleep(10)
-        try:
-            await err.delete()
-        except Exception:
-            pass
+        await _reply_temp(message, f"Забагато запитів. Спробуйте через {cooldown_mins} хв.", ttl=10)
         return
 
     dedup_key = f"{media_url}:{message.chat_id}"
@@ -249,61 +298,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     typing_task = asyncio.create_task(keep_uploading_action(message.chat_id, context.bot))
     try:
         with tempfile.TemporaryDirectory() as tmp_dir:
-            media_path = await asyncio.get_event_loop().run_in_executor(
-                None, download_media, media_url, tmp_dir, platform
-            )
+            loop = asyncio.get_running_loop()
+            media_path = await loop.run_in_executor(None, download_media, media_url, tmp_dir, platform)
             if not media_path or not Path(media_path).exists():
-                err = await message.reply_text(
-                    "Не вдалося завантажити. Контент приватний, видалено або недоступний.",
-                    reply_to_message_id=message.message_id
-                )
-                await asyncio.sleep(5)
-                try:
-                    await err.delete()
-                except Exception:
-                    pass
+                await _reply_temp(message, "Не вдалося завантажити: контент приватний, видалений або недоступний.")
                 return
 
             size_mb = Path(media_path).stat().st_size / 1024 / 1024
             if size_mb > 50:
-                err = await message.reply_text(
-                    f"Файл завеликий ({size_mb:.0f} MB). Telegram приймає до 50 MB.",
-                    reply_to_message_id=message.message_id
-                )
-                await asyncio.sleep(5)
-                try:
-                    await err.delete()
-                except Exception:
-                    pass
+                await _reply_temp(message, f"Файл завеликий ({size_mb:.0f} МБ): Telegram приймає до 50 МБ.")
                 return
 
-            width = height = duration = None
-            try:
-                import subprocess, json as _json
-                probe = subprocess.run(
-                    ["ffprobe", "-v", "error", "-select_streams", "v:0",
-                     "-show_entries", "stream=width,height:format=duration",
-                     "-of", "json", media_path],
-                    capture_output=True, text=True, timeout=10
-                )
-                probe_data = _json.loads(probe.stdout)
-                stream = probe_data.get("streams", [{}])[0]
-                width = stream.get("width")
-                height = stream.get("height")
-                raw_dur = probe_data.get("format", {}).get("duration")
-                duration = int(float(raw_dur)) if raw_dur else None
-                # Перевірка наявності аудіо потоку
-                audio_probe = subprocess.run(
-                    ["ffprobe", "-v", "error", "-select_streams", "a:0",
-                     "-show_entries", "stream=codec_name",
-                     "-of", "json", media_path],
-                    capture_output=True, text=True, timeout=10
-                )
-                has_audio = bool(_json.loads(audio_probe.stdout).get("streams"))
-                if not has_audio:
-                    logger.warning("⚠️ Відео без аудіо потоку — можливо Meta заблокувала трек")
-            except Exception:
-                has_audio = True  # не заважаємо відправці якщо ffprobe впав
+            width, height, duration, has_audio = await loop.run_in_executor(None, _probe, media_path)
+            if not has_audio:
+                logger.warning("Відео без аудіопотоку — можливо, Meta заблокувала трек")
 
             sent = False
             for attempt in range(3):
@@ -335,15 +343,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 except Exception:
                     pass
             else:
-                err = await message.reply_text(
-                    "Помилка при відправці. Спробуйте пізніше.",
-                    reply_to_message_id=message.message_id
-                )
-                await asyncio.sleep(5)
-                try:
-                    await err.delete()
-                except Exception:
-                    pass
+                await _reply_temp(message, "Не вдалося надіслати відео. Спробуйте пізніше.")
+    except Exception as e:  # непередбачена помилка саме цього запиту
+        sig = f"{type(e).__name__}: {str(e)[:80]}"
+        skipped = throttled("req:" + sig)
+        if skipped is not None:
+            logger.error(f"[{platform.upper()}] {media_url} — {sig}{_more(skipped)}", exc_info=True)
+        await _reply_temp(message, "Не вдалося обробити посилання. Спробуйте пізніше.")
     finally:
         typing_task.cancel()
         _processing.discard(dedup_key)
@@ -352,19 +358,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ADMIN
 # ──────────────────────────────────────────
 async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or update.effective_user.id != ADMIN_USER_ID:
-        await update.message.reply_text("Немає доступу.")
+    msg = update.message
+    if not msg or not update.effective_user:
+        return
+    if update.effective_user.id != ADMIN_USER_ID:
+        await msg.reply_text("Немає доступу.")
         return
     args = context.args or []
     count_arg = args[0] if args else "5"
-    chat_id_arg = int(args[1]) if len(args) > 1 else None
+    try:
+        chat_id_arg = int(args[1]) if len(args) > 1 else None
+    except ValueError:
+        await msg.reply_text("Невірний chat_id. Формат: /clean [N|all] [chat_id]")
+        return
     target_chat = chat_id_arg or (next(iter(_sent_messages)) if _sent_messages else None)
     if not target_chat:
-        await update.message.reply_text("Немає збережених повідомлень.")
+        await msg.reply_text("Немає збережених повідомлень.")
         return
     msgs = _sent_messages.get(target_chat)
     if not msgs:
-        await update.message.reply_text(f"Немає повідомлень для чату {target_chat}.")
+        await msg.reply_text(f"Немає повідомлень для чату {target_chat}.")
         return
     all_msgs = list(msgs)
     to_delete = all_msgs if count_arg.lower() == "all" else all_msgs[-(int(count_arg) if count_arg.isdigit() else 5):]
@@ -379,11 +392,11 @@ async def cmd_clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception as e:
             logger.warning(f"Cannot delete {msg_id}: {e}")
             failed += 1
-    await update.message.reply_text(f"Видалено: {deleted} | Не вдалось: {failed}")
+    await msg.reply_text(f"Видалено: {deleted} | Не вдалось: {failed}")
 
 
 async def cmd_chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or update.effective_user.id != ADMIN_USER_ID:
+    if not update.message or not update.effective_user or update.effective_user.id != ADMIN_USER_ID:
         return
     if not _sent_messages:
         await update.message.reply_text("Немає збережених повідомлень.")
@@ -391,6 +404,31 @@ async def cmd_chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ["Чати:"] + [f"  {cid}: {len(m)} шт." for cid, m in _sent_messages.items()]
     lines.append("\n/clean [N|all] [chat_id]")
     await update.message.reply_text("\n".join(lines))
+
+# ──────────────────────────────────────────
+# ERRORS
+# ──────────────────────────────────────────
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Єдина точка для необроблених помилок: лог без спаму + рідкісне сповіщення адміну.
+    Користувачу тут нічого не пишемо — відповіді на його запити формує сам хендлер."""
+    err = context.error
+    sig = f"{type(err).__name__}: {str(err)[:80]}"
+    skipped = throttled("log:" + sig)
+    if isinstance(err, (BadRequest, Forbidden)):  # напр. повідомлення вже видалено / немає прав
+        if skipped is not None:
+            logger.warning(f"Telegram API — {sig}{_more(skipped)}")
+        return
+    if isinstance(err, NetworkError):  # тимчасові збої мережі (TimedOut тощо)
+        if skipped is not None:
+            logger.warning(f"Мережа — {sig}{_more(skipped)}")
+        return
+    if skipped is not None:
+        logger.error(f"Необроблена помилка — {sig}{_more(skipped)}", exc_info=err)
+    if ADMIN_USER_ID and throttled("adm:" + sig, 600) is not None:  # адміну — раз на 10 хв для однакової помилки
+        try:
+            await context.bot.send_message(ADMIN_USER_ID, f"⚠️ Помилка бота: {sig}")
+        except Exception:
+            pass
 
 # ──────────────────────────────────────────
 # APP FACTORY
@@ -403,6 +441,7 @@ def create_application() -> Application:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CommandHandler("clean", cmd_clean))
     app.add_handler(CommandHandler("chats", cmd_chats))
+    app.add_error_handler(on_error)
     logger.info("Бот запущено | yt-dlp (Instagram, Facebook Reels)")
     logger.info(f"Cookies: {'OK' if _COOKIES_FILE else 'НЕ ВСТАНОВЛЕНО'}")
     logger.info(f"Admin: {ADMIN_USER_ID or 'не встановлено'}")

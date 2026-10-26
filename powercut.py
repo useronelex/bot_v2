@@ -25,7 +25,7 @@ ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID") or "0")
 CHANNEL = os.environ.get("POWERCUT_CHANNEL", "pat_cherkasyoblenergo")
 # Бот парсить УСІ черги (для сторінки), а в групи й користувачам (сповіщення, /graph) виводить лише ці.
 # Змінити можна тут або змінною POWERCUT_QUEUES на Render, напр.: 1.1,2.1,3.1,4.2
-DISPLAY_QUEUES = ["1.1", "2.1", "3.1"]
+DISPLAY_QUEUES = ["2.1", "3.1"]
 QUEUES = tuple(q.strip() for q in os.environ.get("POWERCUT_QUEUES", ",".join(DISPLAY_QUEUES)).split(",") if q.strip())
 POLL_INTERVAL = max(5.0, float(os.environ.get("POWERCUT_POLL_SEC") or "10"))
 STATE_PATH = os.environ.get("POWERCUT_STATE_PATH", "powercut_state.json")

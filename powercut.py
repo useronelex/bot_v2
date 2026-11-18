@@ -64,6 +64,7 @@ MY_AREAS = re.compile(
 _SCOPED = re.compile(r"філі|ВСП|району|для споживачів|індивідуальн", re.IGNORECASE)
 _EXCEPT = re.compile(r"\b(?:крім|окрім|за винятком)\b", re.IGNORECASE)
 
+_logged_texts: set[int] = set()
 
 def _is_mine(head: str) -> bool:
     m = _EXCEPT.search(head)
@@ -95,13 +96,16 @@ def _my_text(text: str) -> str:
             cur = None
             prev.append(line.strip())
     hits = [lines for head, lines in blocks if _is_mine(head)]
-    if len(hits) < len(blocks):
+    first_time = hash(text) not in _logged_texts
+    _logged_texts.add(hash(text))
+    if first_time and len(hits) < len(blocks):
         logger.info("Пропущено блоків для інших філій: %d", len(blocks) - len(hits))
     seen: set[str] = set()
     for lines in hits:
         qs = {_QUEUE_LINE.match(l).group(1) for l in lines}
         if seen & qs:
-            logger.warning("Неоднозначне повідомлення: однакові черги в кількох блоках — пропускаю")
+            if first_time:
+                logger.warning("Неоднозначне повідомлення: однакові черги в кількох блоках — пропускаю")
             return ""
         seen |= qs
     return "\n".join(l for lines in hits for l in lines)

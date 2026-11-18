@@ -55,6 +55,58 @@ _DATE_NUM = re.compile(r"(\d{1,2})\.(\d{2})\.(\d{4})")
 _QUEUE_LINE = re.compile(r"^\s*(\d\.\d)\s+(.*)$")
 _INTERVAL = re.compile(r"(\d{1,2}):(\d{2})\s*(?:[-–—]|до)\s*(\d{1,2}):(\d{2})")
 
+# ── Фільтр територій: беремо лише блоки, що стосуються МОЇХ філій ──
+# Обленерго інколи публікує в одному пості кілька блоків (область + окремі графіки для Умані тощо).
+# Список "чужих" міст не ведемо: чужий блок розпізнаємо за формою заголовка (філія / ВСП / для споживачів…).
+MY_AREAS = re.compile(
+    os.environ.get("POWERCUT_MY_AREAS", r"Шпол|\bЧеркаси\b|Черкаськ\w*\s+(?:міськ|енергетичн)"), re.IGNORECASE
+)
+_SCOPED = re.compile(r"філі|ВСП|району|для споживачів|індивідуальн", re.IGNORECASE)
+_EXCEPT = re.compile(r"\b(?:крім|окрім|за винятком)\b", re.IGNORECASE)
+
+
+def _is_mine(head: str) -> bool:
+    m = _EXCEPT.search(head)
+    if m:  # "по області, крім …" — мій, якщо моїх філій після "крім" немає
+        return not MY_AREAS.search(head[m.end():])
+    if MY_AREAS.search(head):  # явно названо мою філію
+        return True
+    return not _SCOPED.search(head)  # назв немає: загальний блок мій, "для споживачів/філій …" — чужий
+
+
+def _my_text(text: str) -> str:
+    """Лишає з повідомлення лише блоки з чергами, що стосуються моїх філій.
+    Блок = послідовність рядків-черг; заголовок = 2 останні рядки перед ним (від емодзі 🔹 не залежимо).
+    Неоднозначність (однакові черги в кількох блоках) → порожній рядок, графік не публікуємо."""
+    text = re.sub(r"[–—−]", "-", text)
+    blocks: list[tuple[str, list[str]]] = []
+    prev: list[str] = []  # непорожні рядки, що не є чергами
+    cur: list[str] | None = None
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        m = _QUEUE_LINE.match(line)
+        if m and _INTERVAL.search(m.group(2)):
+            if cur is None:
+                cur = []
+                blocks.append((" ".join(prev[-2:]), cur))
+            cur.append(line)
+        else:
+            cur = None
+            prev.append(line.strip())
+    hits = [lines for head, lines in blocks if _is_mine(head)]
+    if len(hits) < len(blocks):
+        logger.info("Пропущено блоків для інших філій: %d", len(blocks) - len(hits))
+    seen: set[str] = set()
+    for lines in hits:
+        qs = {_QUEUE_LINE.match(l).group(1) for l in lines}
+        if seen & qs:
+            logger.warning("Неоднозначне повідомлення: однакові черги в кількох блоках — пропускаю")
+            return ""
+        seen |= qs
+    return "\n".join(l for lines in hits for l in lines)
+
+
 # статус для /health
 _status = {"started": None, "last_ok": None, "last_error": None, "restarts": 0}
 
@@ -128,7 +180,7 @@ def parse_message(text: str, today: date) -> tuple[date, dict[str, list[list[int
     if not day:
         return None
     queues: dict[str, list[list[int]]] = {}
-    for line in text.splitlines():
+    for line in _my_text(text).splitlines():
         m = _QUEUE_LINE.match(line)
         if not m:
             continue

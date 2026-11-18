@@ -1,4 +1,6 @@
 import asyncio
+import copy
+import hashlib
 import json
 import logging
 import os
@@ -8,6 +10,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from datetime import date, datetime, timedelta, timezone
+from functools import lru_cache
 
 import httpx
 from bs4 import BeautifulSoup
@@ -27,13 +30,15 @@ CHANNEL = os.environ.get("POWERCUT_CHANNEL", "pat_cherkasyoblenergo")
 # Змінити можна тут або змінною POWERCUT_QUEUES на Render, напр.: 1.1,2.1,3.1,4.2
 DISPLAY_QUEUES = ["2.1", "3.1"]
 QUEUES = tuple(q.strip() for q in os.environ.get("POWERCUT_QUEUES", ",".join(DISPLAY_QUEUES)).split(",") if q.strip())
-POLL_INTERVAL = max(5.0, float(os.environ.get("POWERCUT_POLL_SEC") or "10"))
+# Інтервал опитування t.me/s: 30 с (раніше 10) — менше шансів на 429/бан; змінюється POWERCUT_POLL_SEC
+POLL_INTERVAL = max(5.0, float(os.environ.get("POWERCUT_POLL_SEC") or "30"))
 STATE_PATH = os.environ.get("POWERCUT_STATE_PATH", "powercut_state.json")
 NOTIFY_ON_FIRST_RUN = os.environ.get("POWERCUT_NOTIFY_FIRST_RUN", "0") == "1"
-PAGE_URL = os.environ.get("POWERCUT_PAGE_URL", "https://bot-v2-n8wt.onrender.com/schedule")
+PAGE_URL = os.environ.get("POWERCUT_PAGE_URL", "").strip()  # без значення за замовчуванням: порожньо = кнопки/команди сторінки вимкнені
 MINIAPP_URL = os.environ.get("POWERCUT_MINIAPP_URL", "")  # https://t.me/<бот>/<короткa_назва> — для кнопки в групах
 BUTTON_ENABLED = os.environ.get("POWERCUT_BUTTON", "1") == "1"  # кнопка "Відкрити графік" під повідомленнями з графіком
 PAGE_MSG_TTL = int(os.environ.get("POWERCUT_PAGE_TTL") or "60")  # через скільки сек. прибрати повідомлення з кнопкою (0 = не прибирати)
+ALERT_MAX_AGE = 36 * 3600  # про нерозпізнані пости сповіщаємо лише якщо вони свіжіші за цей вік (сек)
 ALERT_AFTER_SEC = 300  # якщо канал недоступний стільки часів поспіль — сповістити адміна
 
 URL = f"https://t.me/s/{CHANNEL}"
@@ -64,7 +69,6 @@ MY_AREAS = re.compile(
 _SCOPED = re.compile(r"філі|ВСП|району|для споживачів|індивідуальн", re.IGNORECASE)
 _EXCEPT = re.compile(r"\b(?:крім|окрім|за винятком)\b", re.IGNORECASE)
 
-_logged_texts: set[int] = set()
 
 def _is_mine(head: str) -> bool:
     m = _EXCEPT.search(head)
@@ -75,10 +79,9 @@ def _is_mine(head: str) -> bool:
     return not _SCOPED.search(head)  # назв немає: загальний блок мій, "для споживачів/філій …" — чужий
 
 
-def _my_text(text: str) -> str:
-    """Лишає з повідомлення лише блоки з чергами, що стосуються моїх філій.
-    Блок = послідовність рядків-черг; заголовок = 2 останні рядки перед ним (від емодзі 🔹 не залежимо).
-    Неоднозначність (однакові черги в кількох блоках) → порожній рядок, графік не публікуємо."""
+def _select_blocks(text: str) -> tuple[list[list[str]], int, bool]:
+    """(блоки для моїх філій, усього блоків, чи є конфлікт однакових черг).
+    Блок = послідовність рядків-черг; заголовок = 2 останні рядки перед ним (від емодзі 🔹 не залежимо)."""
     text = re.sub(r"[–—−]", "-", text)
     blocks: list[tuple[str, list[str]]] = []
     prev: list[str] = []  # непорожні рядки, що не є чергами
@@ -96,18 +99,25 @@ def _my_text(text: str) -> str:
             cur = None
             prev.append(line.strip())
     hits = [lines for head, lines in blocks if _is_mine(head)]
-    first_time = hash(text) not in _logged_texts
-    _logged_texts.add(hash(text))
-    if first_time and len(hits) < len(blocks):
-        logger.info("Пропущено блоків для інших філій: %d", len(blocks) - len(hits))
     seen: set[str] = set()
     for lines in hits:
         qs = {_QUEUE_LINE.match(l).group(1) for l in lines}
         if seen & qs:
-            if first_time:
-                logger.warning("Неоднозначне повідомлення: однакові черги в кількох блоках — пропускаю")
-            return ""
+            return hits, len(blocks), True
         seen |= qs
+    return hits, len(blocks), False
+
+
+def _my_text(text: str) -> str:
+    """Лишає з повідомлення лише блоки з чергами, що стосуються моїх філій.
+    Конфлікт (однакові черги в кількох блоках) → порожній рядок, графік не публікуємо.
+    Викликається лише з parse_message, який кешується, тож лог пишеться раз на унікальний текст."""
+    hits, total, conflict = _select_blocks(text)
+    if len(hits) < total:
+        logger.info("Пропущено блоків для інших філій: %d", total - len(hits))
+    if conflict:
+        logger.warning("Неоднозначне повідомлення: однакові черги в кількох блоках — пропускаю")
+        return ""
     return "\n".join(l for lines in hits for l in lines)
 
 
@@ -148,22 +158,47 @@ def _now_kyiv() -> datetime:
     return datetime.now(KYIV)
 
 
+_MONTHS_RE = "|".join(MONTHS)
+# 1) "ГПВ на 19 листопада" (але не "станом на 18 листопада")
+_DATE_ON = re.compile(r"(?<!станом )\bна\s+(\d{1,2})\s+(" + _MONTHS_RE + r")\b", re.IGNORECASE)
+# 2) дата, після якої йде "з 00:00", "діятимуть", "будуть застосовані" тощо
+_DATE_ACTION = re.compile(
+    r"(\d{1,2})\s+(" + _MONTHS_RE + r")\b(?:(?!\d{1,2}\s+(?:" + _MONTHS_RE + r")\b)[^.\n]){0,40}?"
+    r"(?:\bз\s+\d{1,2}[:.]\d{2}|діят|будут|застосов|запровадж)",
+    re.IGNORECASE,
+)
+_FIRST_ROW = re.compile(r"(?m)^\s*\d\.\d\s+.*\d{1,2}:\d{2}")
+
+
+def _mk_date(day: int, month: int, today: date) -> date:
+    year = today.year
+    if month == 1 and today.month == 12:
+        year += 1
+    elif month == 12 and today.month == 1:
+        year -= 1
+    return date(year, month, day)
+
+
 def _parse_date(text: str, today: date) -> date | None:
-    m = _DATE_TEXT.search(text)
-    try:
-        if m:
-            day, month = int(m.group(1)), MONTHS[m.group(2).lower()]
-            year = today.year
-            if month == 1 and today.month == 12:
-                year += 1
-            elif month == 12 and today.month == 1:
-                year -= 1
-            return date(year, month, day)
-        m = _DATE_NUM.search(text)
-        if m:
+    """Дата графіка. Пріоритет: "на N місяця" → "N місяця діятимуть/з 00:00" → остання дата до першої черги
+    → перша дата в тексті → числова dd.mm.yyyy. Так згадка іншої дати у вступі не збиває день графіка."""
+    row = _FIRST_ROW.search(text)
+    head = text[: row.start()] if row else text
+    cands = [m.groups() for m in _DATE_ON.finditer(text)][:1]
+    cands += [m.groups() for m in _DATE_ACTION.finditer(text)][:1]
+    cands += [m.groups() for m in _DATE_TEXT.finditer(head)][-1:]
+    cands += [m.groups() for m in _DATE_TEXT.finditer(text)][:1]
+    for d, mon in cands:
+        try:
+            return _mk_date(int(d), MONTHS[mon.lower()], today)
+        except ValueError:
+            continue
+    m = _DATE_NUM.search(text)
+    if m:
+        try:
             return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
-    except ValueError:
-        return None
+        except ValueError:
+            return None
     return None
 
 
@@ -178,7 +213,7 @@ def _normalize(pairs: list[list[int]]) -> list[list[int]]:
     return out
 
 
-def parse_message(text: str, today: date) -> tuple[date, dict[str, list[list[int]]]] | None:
+def _parse_message(text: str, today: date) -> tuple[date, dict[str, list[list[int]]]] | None:
     """Повертає (дата, {черга: [[початок_хв, кінець_хв], ...]}) лише для потрібних черг."""
     day = _parse_date(text, today)
     if not day:
@@ -202,6 +237,17 @@ def parse_message(text: str, today: date) -> tuple[date, dict[str, list[list[int
             queues.setdefault(m.group(1), []).extend(pairs)
     queues = {q: _normalize(p) for q, p in queues.items()}
     return (day, queues) if queues else None
+
+
+@lru_cache(maxsize=512)
+def _parse_message_cached(text: str, today: date):
+    return _parse_message(text, today)
+
+
+def parse_message(text: str, today: date) -> tuple[date, dict[str, list[list[int]]]] | None:
+    """Те саме, що _parse_message, але результат кешується за (текст, день): опитування каналу повторює
+    ті самі повідомлення щоразу, а розбирати їх заново немає потреби. Віддаємо копію, щоб ніхто не зіпсував кеш."""
+    return copy.deepcopy(_parse_message_cached(text, today))
 
 
 def build_current_ts(msgs: list[tuple[str, float | None]], today: date):
@@ -352,7 +398,7 @@ async def _fetch_texts(client: httpx.AsyncClient) -> list[str]:
 
 def _page_markup(private: bool):
     """Кнопка «Відкрити графік»: у приваті — міні-застосунок, у групах (Telegram не дозволяє web_app) — посилання."""
-    if not BUTTON_ENABLED:
+    if not BUTTON_ENABLED or not (PAGE_URL or MINIAPP_URL):
         return None
     label = "📊 Відкрити графік"
     if private:
@@ -375,6 +421,63 @@ async def _send(bot: Bot, chat_id: int, text: str, reply_markup=None) -> bool:
             logger.error(f"Помилка відправки в {chat_id}: {e}")
             await asyncio.sleep(2)
     return False
+
+
+# ──────────────────────────────────────────
+# СПОВІЩЕННЯ АДМІНУ ПРО НЕРОЗПІЗНАНІ ГРАФІКИ
+# ──────────────────────────────────────────
+# Тривога лише там, де формат справді схожий на графік, але розібрати його не вдалося.
+# Звичайні новини, ГОП для бізнесу та графіки лише для інших філій (напр. Умань) — це НЕ тривога.
+_HOURLY_LINE = re.compile(r"(?m)^\W*\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}\s+\d(?:\s*(?:,|та|і)\s*\d)*\s*черг")
+_QUEUE_START = re.compile(r"(?m)^\s*\d\.\d\s+\S")
+
+
+@lru_cache(maxsize=256)
+def _diagnose(text: str, today: date) -> str | None:
+    """Причина, чому пост ВИГЛЯДАЄ як графік, але не розпізнаний. None — розпізнано або це не графік."""
+    if _parse_message_cached(text, today) is not None:
+        return None
+    norm = re.sub(r"[–—−]", "-", text)
+    rows = [l for l in norm.splitlines() if (m := _QUEUE_LINE.match(l)) and _INTERVAL.search(m.group(2))]
+    if rows:
+        if _parse_date(text, today) is None:
+            return "є рядки з чергами, але не знайдено дату"
+        _, _, conflict = _select_blocks(text)
+        if conflict:
+            return "однакові черги в кількох блоках (неоднозначно)"
+        return None  # усі блоки для інших філій (напр. лише Умань) — очікувано, не тривога
+    if len(_HOURLY_LINE.findall(norm)) >= 3:
+        return "графік у іншому форматі: по годинах («00:00-01:00 6 та 1 черги»)"
+    starts = _QUEUE_START.findall(norm)
+    if len(starts) >= 3 and re.search(r"відключ|електропостач", norm, re.IGNORECASE):
+        return "є рядки з номерами черг, але формат часу не розпізнано"
+    return None
+
+
+async def _check_unrecognized(bot: Bot, msgs: list[tuple[str, float | None]], state: dict, today: date) -> None:
+    """Сповіщає адміна (один раз на пост) про свіжі пости, схожі на графік, але нерозпізнані."""
+    alerted: list[str] = state.setdefault("alerted", [])
+    now = time.time()
+    dirty = False
+    for text, ts in msgs:
+        if ts is None or now - ts > ALERT_MAX_AGE:
+            continue
+        reason = _diagnose(text, today)
+        if not reason:
+            continue
+        key = hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+        if key in alerted:
+            continue
+        logger.warning("Нерозпізнаний графік: %s", reason)
+        if ADMIN_USER_ID:
+            body = f"⚠️ Не вдалося розпізнати графік: {reason}.\nГрафік у боті НЕ оновлено.\n\n{text[:1500]}"
+            if not await _send(bot, ADMIN_USER_ID, body):
+                continue  # не вдалося надіслати — спробуємо наступного циклу
+        alerted.append(key)
+        dirty = True
+    if dirty:
+        del alerted[:-100]
+        _save_state(state)
 
 
 async def _process(bot: Bot, texts: list[str], state: dict, today: date, now_min: int | None = None) -> None:
@@ -556,8 +659,11 @@ async def cmd_web(update, context) -> None:
     chat = update.effective_chat
     await _delete_quietly(msg)
 
+    if not (PAGE_URL or MINIAPP_URL):
+        await _notice(context.bot, chat_id, "Сторінка графіка не налаштована (змінна POWERCUT_PAGE_URL).")
+        return
     label = "📊 Відкрити графік"
-    if chat is not None and chat.type == "private":
+    if chat is not None and chat.type == "private" and PAGE_URL:
         button = InlineKeyboardButton(label, web_app=WebAppInfo(url=PAGE_URL))  # міні-застосунок у приваті
     else:
         # у групах web_app-кнопки Telegram не дозволяє; пряме посилання на міні-застосунок відкриє його як застосунок
@@ -581,6 +687,7 @@ async def _monitor(bot: Bot) -> None:
     _state_ref = state
     _publish_api_from_state(state)
     fails = 0
+    rl_hits = 0  # підряд 429 від t.me: пауза росте вдвічі
     fail_since: float | None = None
     alerted = False
     headers = {
@@ -601,20 +708,25 @@ async def _monitor(bot: Bot) -> None:
                 _publish_api(msgs)
                 if fails:
                     logger.info(f"Канал знову доступний після {fails} помилок")
-                fails, fail_since = 0, None
+                fails, fail_since, rl_hits = 0, None, 0
                 _status["last_ok"] = time.time()
                 if alerted and ADMIN_USER_ID:
                     await _send(bot, ADMIN_USER_ID, "✅ Моніторинг каналу відновлено.")
                 alerted = False
                 kn = _now_kyiv()
                 await _process(bot, texts, state, kn.date(), kn.hour * 60 + kn.minute)
+                try:
+                    await _check_unrecognized(bot, msgs, state, kn.date())
+                except Exception as e:  # діагностика не має валити моніторинг
+                    logger.error(f"Помилка перевірки нерозпізнаних постів: {e}")
             except asyncio.CancelledError:
                 raise
             except _RateLimited as e:
                 fails += 1
                 fail_since = fail_since or time.time()
-                delay = max(e.retry_after, 60)
-                logger.warning(f"t.me обмежив запити, пауза {delay:.0f}с")
+                rl_hits += 1
+                delay = min(max(e.retry_after, 60) * 2 ** (rl_hits - 1), 900)
+                logger.warning(f"t.me обмежив запити ({rl_hits} підряд), пауза {delay:.0f}с")
             except Exception as e:
                 fails += 1
                 fail_since = fail_since or time.time()

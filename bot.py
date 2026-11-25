@@ -26,7 +26,9 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID") or "0")
 INSTAGRAM_COOKIES_RAW = os.environ.get("INSTAGRAM_COOKIES", "").replace("\\n", "\n").replace("\\t", "\t")
+TIKTOK_COOKIES_RAW = os.environ.get("TIKTOK_COOKIES", "").replace("\\n", "\n").replace("\\t", "\t")
 _COOKIES_FILE: str | None = None
+_TIKTOK_COOKIES_FILE: str | None = None
 
 REQUEST_LIMIT = 50
 REQUEST_WINDOW = 3600
@@ -57,6 +59,13 @@ FACEBOOK_PATTERNS = [
     re.compile(r'https?://(?:www\.|m\.|web\.)?facebook\.com/share/r/[\w-]+'),
 ]
 
+TIKTOK_PATTERNS = [
+    re.compile(r'https?://(?:www\.|m\.)?tiktok\.com/@[\w.-]+/video/\d+'),
+    re.compile(r'https?://(?:www\.|m\.)?tiktok\.com/v/\d+'),
+    re.compile(r'https?://(?:vm|vt)\.tiktok\.com/[\w-]+'),
+    re.compile(r'https?://(?:www\.|m\.)?tiktok\.com/t/[\w-]+'),
+]
+
 
 def extract_url(text: str) -> tuple[str, str] | None:
     for pattern in INSTAGRAM_PATTERNS:
@@ -67,13 +76,23 @@ def extract_url(text: str) -> tuple[str, str] | None:
         match = pattern.search(text)
         if match:
             return match.group(0).split('?')[0], "facebook"
+    for pattern in TIKTOK_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return match.group(0).split('?')[0].rstrip('/'), "tiktok"
     return None
 
 # ──────────────────────────────────────────
 # COOKIES
 # ──────────────────────────────────────────
 def _init_cookies() -> None:
-    global _COOKIES_FILE
+    global _COOKIES_FILE, _TIKTOK_COOKIES_FILE
+    if TIKTOK_COOKIES_RAW:
+        tt_path = "/tmp/tiktok_cookies.txt"
+        with open(tt_path, "w") as f:
+            f.write(TIKTOK_COOKIES_RAW)
+        _TIKTOK_COOKIES_FILE = tt_path
+        logger.info("TikTok cookies завантажено")
     if not INSTAGRAM_COOKIES_RAW:
         logger.warning("INSTAGRAM_COOKIES не встановлено")
         return
@@ -88,8 +107,9 @@ def _init_cookies() -> None:
 # МЕТОД 1: yt-dlp
 # ──────────────────────────────────────────
 
-def _download_ytdlp(url: str, output_dir: str) -> str | None:
+def _download_ytdlp(url: str, output_dir: str, platform: str = "instagram") -> str | None:
     import yt_dlp
+    is_tiktok = platform == "tiktok"
     fmt = (
         "bestvideo[vcodec!=unknown]+bestaudio[ext=m4a]/"
         "bestvideo[vcodec!=unknown]+bestaudio/"
@@ -130,7 +150,16 @@ def _download_ytdlp(url: str, output_dir: str) -> str | None:
             "ffmpegvideoconvertor": ["-movflags", "+faststart"],
         },
     }
-    if _COOKIES_FILE:
+    if is_tiktok:
+        # TikTok: комбіновані потоки (відео+аудіо разом), H.264 надійніше за HEVC у Telegram;
+        # власний User-Agent не підставляємо — yt-dlp має свої заголовки для TikTok
+        ydl_opts["format"] = "best[acodec!=none][vcodec^=h264]/best[acodec!=none]/best"
+        ydl_opts.pop("format_sort", None)  # типове сортування yt-dlp (воно ж відсікає версію з водяним знаком)
+        ydl_opts.pop("format_sort_force", None)
+        ydl_opts.pop("http_headers", None)
+        if _TIKTOK_COOKIES_FILE:
+            ydl_opts["cookiefile"] = _TIKTOK_COOKIES_FILE
+    elif _COOKIES_FILE:
         ydl_opts["cookiefile"] = _COOKIES_FILE
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -168,8 +197,9 @@ def _download_ytdlp(url: str, output_dir: str) -> str | None:
 # DISPATCH
 # ──────────────────────────────────────────
 def download_media(url: str, output_dir: str, platform: str) -> str | None:
-    logger.info(f"yt-dlp: {'cookies активні' if _COOKIES_FILE else 'без cookies'} | {platform} | {url}")
-    return _download_ytdlp(url, output_dir)
+    has_cookies = _TIKTOK_COOKIES_FILE if platform == "tiktok" else _COOKIES_FILE
+    logger.info(f"yt-dlp: {'cookies активні' if has_cookies else 'без cookies'} | {platform} | {url}")
+    return _download_ytdlp(url, output_dir, platform)
 
 # ──────────────────────────────────────────
 # HELPERS
